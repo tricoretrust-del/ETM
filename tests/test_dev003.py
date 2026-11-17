@@ -230,6 +230,54 @@ class TestDev003(Base):
             self.new_plan(links=[{"role": "basis", "kind": "lag", "id": 2}])
 
 
+class TestPlanToLagLoop(Base):
+    """수정 결함: PLN 실행 결과·사건·증빙을 LAG 검증 근거로 쓸 수 있어야 한다(DEV-003 §4)."""
+
+    def done_plan(self, **kw):
+        pid = self.new_plan(**kw)
+        self.run_to_progress(pid)
+        self.cmd(plan.complete, plan_id=pid, actor="staff", result="10건 중 2건에서 메시지가 1개 많음",
+                 evidence=[{"kind": "event", "id": self.ev}])
+        return pid
+
+    def test_plan_result_closes_the_loop(self):
+        pid = self.done_plan()
+        vid = self.cmd(learn.add_verification, lag_id=self.lag, actor="staff", method="실행계획 결과 대조",
+                       plan_ids=[pid], expected="반복 여부 확인")
+        v = self.c.execute("SELECT * FROM verification WHERE id=?", (vid,)).fetchone()
+        self.assertIn("10건 중 2건", v["observed"])                     # PLN 결과를 다시 입력하지 않고 참조
+        self.assertEqual(learn.verification_evidence(self.c, vid), [f"PLN-{pid}"])
+        self.assertEqual(self.c.execute("SELECT status FROM lag WHERE id=?", (self.lag,)).fetchone()[0], "awaiting")
+        self.cmd(learn.judge_lag, lag_id=self.lag, actor="owner", kind="rejected", reason="상차 직후 추가분 — 규칙 불필요")
+        self.assertEqual(self.c.execute("SELECT status, outcome FROM lag WHERE id=?", (self.lag,)).fetchone()[:],
+                         ("closed", "rejected"))
+        self.assertEqual(plan.detail(self.c, pid)["status"], "DONE")    # 판정이 계획을 바꾸지 않음
+
+    def test_event_evidence_needs_observation(self):
+        with self.assertRaises(ValueError):          # 사건만으로는 관찰 결과를 적어야 함
+            self.cmd(learn.add_verification, lag_id=self.lag, actor="staff", method="현장 확인", event_ids=[self.ev],
+                     expected="x")
+        self.cmd(learn.add_verification, lag_id=self.lag, actor="staff", method="현장 확인", event_ids=[self.ev],
+                 intake_ids=[self.intake], expected="x", observed="현장 수량 13개 확인")
+        self.assertEqual(self.c.execute("SELECT status FROM lag WHERE id=?", (self.lag,)).fetchone()[0], "awaiting")
+
+    def test_guards(self):
+        draft = self.new_plan()
+        with self.assertRaises(ValueError):          # 완료 전 계획은 근거가 아님
+            self.cmd(learn.add_verification, lag_id=self.lag, actor="staff", method="m", plan_ids=[draft], expected="x")
+        with self.assertRaises(ValueError):          # 근거 없음
+            self.cmd(learn.add_verification, lag_id=self.lag, actor="staff", method="m", expected="x")
+        with self.assertRaises(Forbidden):
+            self.cmd(learn.add_verification, lag_id=self.lag, actor="system", method="m", event_ids=[self.ev],
+                     expected="x", observed="o")
+        self.c.execute("INSERT INTO company(id, name) VALUES (2, '다른 회사(시험)')")
+        other = process.intake(self.c, shipment(5, 5, company_id=2))["event_id"]
+        with self.assertRaises(Forbidden):           # 회사 경계
+            self.cmd(learn.add_verification, lag_id=self.lag, actor="staff", method="m", event_ids=[other],
+                     expected="x", observed="o")
+        self.assertEqual(self.c.execute("SELECT COUNT(*) FROM verification").fetchone()[0], 0)   # 실패는 흔적 없음
+
+
 class TestMigrationOfExistingDb(unittest.TestCase):
     def test_upgrade_v3_database_preserves_data(self):
         """0003 까지 적용된 DB(기존 사용자 DB)에 0004 를 비파괴로 적용."""
@@ -250,7 +298,7 @@ class TestMigrationOfExistingDb(unittest.TestCase):
         c.execute("PRAGMA foreign_keys=ON")
         before = {t: c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("rulebook", "curriculum", "lag", "rule_version")}
         db.migrate(c)
-        self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 4)
+        self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], len(db.MIGRATIONS))
         after = {t: c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in before}
         self.assertEqual(before, after)                                    # 지운 것 없음
         self.assertEqual(c.execute("SELECT COUNT(*) FROM reclassification").fetchone()[0], 6)

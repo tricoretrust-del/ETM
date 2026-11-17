@@ -159,10 +159,11 @@ async function showLearning(){
       ${l.plans.length?`<div class="meta">실행계획: ${l.plans.map(p=>`<button class="link" onclick="showPlan(${p.id})">PLN-${p.id} ${esc(p.title)} (${PLN_ST[p.status]})</button>`).join(" ")}</div>`:""}
       ${l.status!=="closed"?`<button class="link" onclick="newPlan({lag:${l.id}})">+ 실행계획</button>`:""}
       <div class="row">${l.status==="awaiting"?`<button class="primary" onclick="judge(${l.id},'rule')">규칙 반영(승인 대기 버전 생성)</button><button onclick="judge(${l.id},'rejected')">기각</button><button onclick="judge(${l.id},'hold')">보류</button>`:""}
-        ${["open","verifying"].includes(l.status)&&l.case_ids.length?`<button onclick="lcmd('verify',{lag_id:${l.id},case_ids:${JSON.stringify(l.case_ids)},expected:'같은 상황에서 같은 답'})">사례 검증 기록</button>`:""}
+        ${["open","verifying","awaiting"].includes(l.status)&&l.case_ids.length?`<button onclick="lcmd('verify',{lag_id:${l.id},case_ids:${JSON.stringify(l.case_ids)},expected:'같은 상황에서 같은 답'})">사례 검증 기록</button>`:""}
+        ${["open","verifying","awaiting"].includes(l.status)&&l.plans.some(p=>p.status==="DONE")?`<button onclick="verifyByPlans(${l.id},${JSON.stringify(l.plans.filter(p=>p.status==="DONE").map(p=>p.id))})">완료된 실행계획 결과로 검증 기록</button>`:""}
         ${["open","verifying"].includes(l.status)?`<button class="link" onclick="judge(${l.id},'hold')">보류</button>`:""}
         ${["closed","held"].includes(l.status)?`<button class="link" onclick="judge(${l.id},'reopen')">재개</button>`:""}</div>
-      <details><summary>검증·이력</summary>${l.verifications.map(v=>`<div class="meta">검증#${v.id} ${esc(v.method)} · 기대: ${esc(v.expected)} · 관찰: ${esc(v.observed)}${v.limits?" · 한계: "+esc(v.limits):""} · ${esc(v.actor)}</div>`).join("")}
+      <details><summary>검증·이력</summary>${l.verifications.map(v=>`<div class="meta">검증#${v.id} ${esc(v.method)} · 기대: ${esc(v.expected)} · 관찰: ${esc(v.observed)}${v.limits?" · 한계: "+esc(v.limits):""} · 근거: ${esc((v.evidence||[]).join(", "))} · ${esc(v.actor)}</div>`).join("")}
         ${l.log.map(x=>`<div class="meta">${esc(x.at.slice(5,16).replace("T"," "))} ${esc(LAG_ST[x.from_status]||"-")} → ${esc(LAG_ST[x.to_status]||x.to_status)} ${esc(x.note||"")} (${esc(x.actor)})</div>`).join("")}</details>
     </div>`).join(""):'<div class="empty">없습니다.</div>'}</div>
   <div class="card"><div class="title">PLN — 실행계획</div>
@@ -234,6 +235,11 @@ async function newLag(eventId){
   const q = prompt("이 사건에서 생긴 질문·문제 (무엇을 아직 모르는가)"); if(!q) return;
   try{ await api("/api/learning/create_lag", {request_id: rid(), question:q, context:{}, event_ids:[eventId]}); await openEvent(eventId); }
   catch(e){ $("#err").textContent = e.message; }
+}
+function verifyByPlans(lagId, planIds){
+  const expected = prompt("무엇이 확인되면 이 질문에 답할 수 있나? (검증 기준)"); if(expected===null) return;
+  const limits = prompt("한계·주의 (없으면 비워 두기)", "") || "";
+  lcmd("verify", {lag_id: lagId, plan_ids: planIds, method: "실행계획 결과 대조", expected, limits});
 }
 function askReason(id, to, ev){ const reason = prompt(`${PLN_ST[to]} 사유`); if(reason===null) return; pcmd("transition", {plan_id:id, to, reason, expected_version:ev}); }
 async function completePlan(id, ev){

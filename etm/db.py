@@ -436,6 +436,22 @@ MIGRATIONS: list[str] = [
     );
     ALTER TABLE lag ADD COLUMN layer TEXT NOT NULL DEFAULT 'ops';   -- ops | trnk(설계 계층으로 재분류됨)
     """,
+    # ---- 0005: LAG 검증 근거 확장 — PLN 실행 결과·사건·증빙을 검증 근거로 참조 (DEV-003 §4) --------
+    """
+    CREATE TABLE verification_evidence (
+        id INTEGER PRIMARY KEY,
+        verification_id INTEGER NOT NULL REFERENCES verification(id),
+        plan_id INTEGER REFERENCES plan(id),
+        event_id INTEGER REFERENCES event(id),
+        intake_id INTEGER REFERENCES intake(id),
+        CHECK ((plan_id IS NOT NULL) + (event_id IS NOT NULL) + (intake_id IS NOT NULL) = 1)
+    );
+    CREATE INDEX verification_evidence_v ON verification_evidence(verification_id);
+    -- 회사 경계: 검증 대상 LAG 와 같은 회사의 근거만
+    CREATE TRIGGER verification_evidence_company BEFORE INSERT ON verification_evidence WHEN (SELECT l.company_id FROM verification v JOIN lag l ON l.id=v.lag_id WHERE v.id=NEW.verification_id) <> COALESCE((SELECT company_id FROM plan WHERE id=NEW.plan_id), (SELECT company_id FROM event WHERE id=NEW.event_id), (SELECT e.company_id FROM intake i JOIN event e ON e.id=i.event_id WHERE i.id=NEW.intake_id)) BEGIN SELECT RAISE(ABORT, '회사 경계를 넘는 검증 근거입니다'); END;
+    -- 실행 결과가 없는 계획(완료 전)은 검증 근거가 될 수 없다
+    CREATE TRIGGER verification_evidence_plan_done BEFORE INSERT ON verification_evidence WHEN NEW.plan_id IS NOT NULL AND (SELECT status FROM plan WHERE id=NEW.plan_id) <> 'DONE' BEGIN SELECT RAISE(ABORT, '완료되지 않은 실행계획은 검증 근거가 될 수 없습니다'); END;
+    """,
 ]
 
 # 이번 구현에서 명시적으로 적용하는 고정 규칙(운영 룰북 초기값)

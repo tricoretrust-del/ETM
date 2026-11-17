@@ -240,26 +240,68 @@ def link_lag(conn, lag_id, *, case_ids=(), event_ids=()):
             conn.execute("INSERT INTO lag_link(lag_id, event_id) VALUES (?,?)", (lag_id, eid))
 
 
-def add_verification(conn, *, lag_id, actor, method, case_ids, expected, observed=None, limits=""):
-    user(conn, actor)
+def add_verification(conn, *, lag_id, actor, method, case_ids=(), expected, observed=None, limits="",
+                     plan_ids=(), event_ids=(), intake_ids=()):
+    """검증 기록. 근거는 판단 기록(case_ids), 완료된 실행계획(plan_ids), 사건·증빙(event_ids, intake_ids) 중 하나 이상.
+    관찰 결과(observed)를 비우면 사례의 답·계획의 실행 결과에서 그대로 가져온다(다시 입력시키지 않음)."""
+    import sqlite3
+    u = user(conn, actor)
+    if u["role"] == "system":
+        raise Forbidden("시스템은 검증 기록을 남길 수 없습니다")
     lag = conn.execute("SELECT * FROM lag WHERE id=?", (lag_id,)).fetchone()
     if not lag or lag["status"] in ("closed",):
         raise ValueError("종료된 LAG 에는 검증을 추가할 수 없습니다. 먼저 재개하세요")
     rows = [conn.execute("SELECT * FROM decision_case WHERE id=?", (c,)).fetchone() for c in case_ids]
-    if not rows or any(r is None for r in rows):
-        raise ValueError("검증에 쓸 확인 기록이 필요합니다")
-    if observed is None:
-        c = Counter(r["answer"] for r in rows)
-        observed = f"사례 {len(rows)}건: " + ", ".join(f"{_answer_text(rows[0]['decision_kind'], json.loads(a))} {n}건"
-                                                     for a, n in c.most_common())
+    if any(r is None for r in rows):
+        raise ValueError("없는 확인 기록이 있습니다")
+    plans = [conn.execute("SELECT * FROM plan WHERE id=?", (p,)).fetchone() for p in plan_ids]
+    if any(p is None for p in plans):
+        raise ValueError("없는 실행계획이 있습니다")
+    for p in plans:
+        if p["status"] != "DONE":
+            raise ValueError(f"PLN-{p['id']} 은(는) 완료되지 않아 실행 결과가 없습니다")
+    if not (rows or plans or event_ids or intake_ids):
+        raise ValueError("검증 근거(확인 기록·완료된 실행계획·사건·증빙)가 하나 이상 필요합니다")
+    if observed is None or not str(observed).strip():
+        parts = []
+        if rows:
+            c = Counter(r["answer"] for r in rows)
+            parts.append(f"사례 {len(rows)}건: " + ", ".join(
+                f"{_answer_text(rows[0]['decision_kind'], json.loads(a))} {n}건" for a, n in c.most_common()))
+        for p in plans:
+            parts.append(f"PLN-{p['id']} 결과: {p['result']}")
+        if not parts:
+            raise ValueError("사건·증빙만으로 검증할 때는 관찰 결과를 적어 주세요")
+        observed = " / ".join(parts)
     vid = conn.execute("INSERT INTO verification(lag_id, method, expected, observed, limits, actor, at)"
                        " VALUES (?,?,?,?,?,?,?)", (lag_id, method, expected, observed, limits, actor, _now())).lastrowid
     for r in rows:
         conn.execute("INSERT INTO verification_case(verification_id, decision_case_id) VALUES (?,?)", (vid, r["id"]))
-    link_lag(conn, lag_id, case_ids=[r["id"] for r in rows])
+    try:
+        for col, ids in (("plan_id", [p["id"] for p in plans]), ("event_id", event_ids), ("intake_id", intake_ids)):
+            for x in ids:
+                conn.execute(f"INSERT INTO verification_evidence(verification_id, {col}) VALUES (?,?)", (vid, int(x)))
+    except sqlite3.IntegrityError as e:
+        if "회사 경계" in str(e):
+            raise Forbidden("다른 회사의 기록은 검증 근거로 쓸 수 없습니다") from e
+        raise ValueError(str(e)) from e
+    # LAG 근거에도 연결(계획이 증빙으로 쓴 사건 포함)
+    ev_ids = list(event_ids)
+    for p in plans:
+        ev_ids += [r[0] for r in conn.execute(
+            "SELECT event_id FROM plan_link WHERE plan_id=? AND event_id IS NOT NULL AND removed_at IS NULL", (p["id"],))]
+    link_lag(conn, lag_id, case_ids=[r["id"] for r in rows], event_ids=sorted(set(ev_ids)))
     if lag["status"] in ("open", "verifying"):
         _lag_status(conn, lag_id, "awaiting", actor, f"검증 기록 #{vid}")
     return vid
+
+
+def verification_evidence(conn, vid) -> list[str]:
+    out = []
+    for r in conn.execute("SELECT * FROM verification_evidence WHERE verification_id=? ORDER BY id", (vid,)):
+        out.append(f"PLN-{r['plan_id']}" if r["plan_id"] else f"사건#{r['event_id']}" if r["event_id"] else f"증빙#{r['intake_id']}")
+    out += [f"사례#{r[0]}" for r in conn.execute("SELECT decision_case_id FROM verification_case WHERE verification_id=?", (vid,))]
+    return out
 
 
 def judge_lag(conn, *, lag_id, actor, kind, reason="", scope=None, action=None):
@@ -446,7 +488,8 @@ def overview(conn, company_id=1) -> dict:
                           " THEN 1 WHEN 'verifying' THEN 1 WHEN 'held' THEN 2 ELSE 3 END, id DESC", (company_id,)):
         lags.append(dict(l) | {
             "links": conn.execute("SELECT COUNT(*) FROM lag_link WHERE lag_id=?", (l["id"],)).fetchone()[0],
-            "verifications": [dict(v) for v in conn.execute("SELECT * FROM verification WHERE lag_id=? ORDER BY id", (l["id"],))],
+            "verifications": [dict(v) | {"evidence": verification_evidence(conn, v["id"])} for v in conn.execute(
+                "SELECT * FROM verification WHERE lag_id=? ORDER BY id", (l["id"],))],
             "log": [dict(x) for x in conn.execute("SELECT * FROM lag_log WHERE lag_id=? ORDER BY id", (l["id"],))],
             "plans": [{"id": p["id"], "title": p["title"], "status": p["status"]}
                       for p in plan_mod.list_plans(conn, company_id, lag_id=l["id"])],

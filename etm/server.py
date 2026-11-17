@@ -27,7 +27,9 @@ class App:
                 case_ids=b.get("case_ids") or [], event_ids=b.get("event_ids") or [])},
             "verify": lambda: {"verification_id": learn.add_verification(
                 c, lag_id=int(b["lag_id"]), actor=actor, method=b.get("method") or "사례 대조",
-                case_ids=b.get("case_ids") or [], expected=b.get("expected") or "", limits=b.get("limits") or "")},
+                case_ids=b.get("case_ids") or [], expected=b.get("expected") or "", limits=b.get("limits") or "",
+                observed=b.get("observed"), plan_ids=b.get("plan_ids") or [], event_ids=b.get("event_ids") or [],
+                intake_ids=b.get("intake_ids") or [])},
             "judge": lambda: learn.judge_lag(c, lag_id=int(b["lag_id"]), actor=actor, kind=b.get("kind", ""),
                                              reason=b.get("reason") or "", scope=b.get("scope"), action=b.get("action")),
             "approve": lambda: learn.approve_version(c, version_id=int(b["version_id"]), actor=actor,
