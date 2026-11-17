@@ -1,0 +1,33 @@
+ETM 실행 중: http://127.0.0.1:8765  (DB: /home/user/etm/ui.db)
+----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 52926)
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.13/socketserver.py", line 697, in process_request_thread
+    self.finish_request(request, client_address)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.13/socketserver.py", line 362, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.13/socketserver.py", line 766, in __init__
+    self.handle()
+    ~~~~~~~~~~~^^
+  File "/usr/local/lib/python3.13/http/server.py", line 451, in handle
+    self.handle_one_request()
+    ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/usr/local/lib/python3.13/http/server.py", line 439, in handle_one_request
+    method()
+    ~~~~~~^^
+  File "/home/user/etm/etm/server.py", line 195, in do_POST
+    self._dispatch("POST")
+    ~~~~~~~~~~~~~~^^^^^^^^
+  File "/home/user/etm/etm/server.py", line 189, in _dispatch
+    self._send(status, payload)
+    ~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/user/etm/etm/server.py", line 160, in _send
+    self.wfile.write(data)
+    ~~~~~~~~~~~~~~~~^^^^^^
+  File "/usr/local/lib/python3.13/socketserver.py", line 845, in write
+    self._sock.sendall(b)
+    ~~~~~~~~~~~~~~~~~~^^^
+BrokenPipeError: [Errno 32] Broken pipe
+----------------------------------------

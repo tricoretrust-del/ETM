@@ -292,8 +292,80 @@ function home(msg){
       <div id="m_lines"></div>
       <div class="row"><button class="link" onclick="addLine()">+ 품목</button><input id="m_pal" type="number" min="0" placeholder="팔레트(선택)" style="width:110px"><button class="primary" onclick="submitManual()">접수</button></div>
     </div>
-    <div class="err" id="err">${esc(msg||"")}</div></div>`;
+    <div class="err" id="err">${esc(msg||"")}</div></div><div id="dlist"></div>`;
   addLine();
+  showDialogList();
+}
+// ---------------- 문답 (DEV-004 v0.2): 자료 해석 → 질문 → 자연어 답 → 반영
+let LLM = "off";
+const D_ST = {asking:"답을 기다림", applied:"반영됨", kept:"보관됨", failed:"보류"};
+const CAND = {rbk:"규칙으로 등록", lag:"검토 과제로 등록", pln:"할 일로 등록"};
+async function showDialogList(){
+  try{
+    const r = await api("/api/dialogs"); LLM = r.provider;
+    const open = r.dialogs.filter(x=>x.status==="asking"||x.status==="failed");
+    if(!open.length || !$("#dlist")) return;
+    $("#dlist").innerHTML = `<h2>이어서 답할 자료</h2>` + open.map(x=>`<div class="h" onclick="openDialog(${x.id})">`+
+      `<span class="chip open">${D_ST[x.status]}</span>${esc(x.head)}</div>`).join("");
+  }catch(e){}
+}
+function busy(on){ const b=$("#dbusy"); if(b) b.hidden=!on; document.querySelectorAll("#left button").forEach(x=>x.disabled=on); }
+async function startDialog(text){
+  $("#err").textContent = "자료를 읽는 중… (몇 초 걸립니다)";
+  document.querySelectorAll("#left button").forEach(x=>x.disabled=true);
+  try{ showDialog(await api("/api/dialogs", {text})); }
+  catch(e){ home(e.message); }
+}
+async function openDialog(id){ try{ showDialog(await api(`/api/dialogs/${id}`)); }catch(e){ home(e.message); } }
+async function dsend(id, qid, rev, choice){
+  const text = choice ? null : ($("#dans").value||"").trim();
+  if(!choice && !text) return;
+  busy(true);
+  try{ showDialog(await api(`/api/dialogs/${id}/answer`, {question_id:qid, revision:rev, text, choice})); }
+  catch(e){ busy(false); $("#derr").textContent = e.message; }
+}
+async function dretry(id){ busy(true); try{ showDialog(await api(`/api/dialogs/${id}/retry`, {})); }catch(e){ busy(false); $("#derr").textContent=e.message; } }
+async function dcand(did, cid, act){
+  try{ const r = await api(`/api/candidates/${cid}/${act}`, {}); await openDialog(did);
+       if(act==="accept") $("#derr").textContent = r.rule_id ? `규칙 ${r.rule_id} 등록됨${r.status==="active"?" (바로 적용)":" (승인 대기)"}` : "등록됨";
+       refreshSide(); }
+  catch(e){ $("#derr").textContent = e.message; }
+}
+function showDialog(d){
+  current = null;
+  const q = d.open_question;
+  const qa = d.questions.filter(x=>x.status!=="open").map(x=>{
+    const a = d.answers.filter(y=>y.question_id===x.id).pop();
+    return `<div class="meta" style="margin-top:6px">물음: ${esc(x.text)}</div><div>답: ${esc(a?a.raw_text:"(다른 질문으로 대체됨)")}</div>`;
+  }).join("");
+  let body = "";
+  if(q){
+    body = `<div class="check"><div class="q">${esc(q.text)}</div>`+
+      `<div class="row">${q.options.map(o=>`<button onclick='dsend(${d.id},${q.id},${d.revision},${esc(JSON.stringify(o))})'>${esc(o)}</button>`).join("")}</div>`+
+      `<div class="row"><input id="dans" style="flex:1;min-width:200px" placeholder="말로 답해도 됩니다 (예: LOGISALL에서 팔레트 들어온 거야)"`+
+      ` onkeydown="if(event.key==='Enter')dsend(${d.id},${q.id},${d.revision})">`+
+      `<button class="primary" onclick="dsend(${d.id},${q.id},${d.revision})">답하기</button></div></div>`;
+  } else if(d.status==="applied" || d.status==="kept"){
+    body = `<div class="check" style="border-color:var(--ok);background:var(--ok-bg)"><div class="q">${d.status==="applied"?"반영했습니다.":"재고와 무관한 자료로 보관했습니다."}</div>`+
+      (d.event_id?`<div class="row"><button class="primary" onclick="openEvent(${d.event_id})">처리 내용 보기</button></div>`:"")+`</div>`;
+  } else if(d.status==="failed"){
+    body = `<div class="check"><div class="q">자료를 해석하지 못해 반영을 보류했습니다. 원문과 답변은 그대로 남아 있습니다.</div>`+
+      `<details><summary>자세히</summary><div class="meta">${esc(d.status_reason||"")}</div></details>`+
+      `<div class="row"><button class="primary" onclick="dretry(${d.id})">다시 해석</button></div></div>`;
+  }
+  const cands = d.candidates.filter(c=>c.status==="suggested").map(c=>
+    `<div class="card" style="margin:6px 0"><div>${esc(c.text)}</div>`+
+    (c.kind==="rbk" && !c.explicit_instruction ? `<div class="meta">일반화 지시가 없어 규칙으로 바로 등록할 수 없습니다.</div>`
+      : `<div class="row"><button class="primary" onclick="dcand(${d.id},${c.id},'accept')">${CAND[c.kind]||"등록"}</button>`+
+        `<button onclick="dcand(${d.id},${c.id},'dismiss')">무시</button></div>`)+`</div>`).join("");
+  const done = d.candidates.filter(c=>c.status==="accepted").map(c=>`<span class="chip done">${esc(c.text.slice(0,40))}</span>`).join("");
+  $("#left").innerHTML = `<div class="row" style="margin:0 0 8px"><button class="link" onclick="home()">← 새 자료</button></div>
+    <h2>자료 문답 #${d.id} · ${D_ST[d.status]||esc(d.status)}</h2><div class="card">
+    ${d.hypothesis?`<div class="meta">읽은 내용: ${esc(d.hypothesis.description)}</div>`:""}
+    <details><summary>원문</summary><pre>${esc(d.raw_input)}</pre></details>
+    ${qa}${body}<div id="dbusy" class="meta" hidden>생각하는 중…</div><div class="err" id="derr"></div></div>
+    ${cands?`<h2>학습 제안</h2>${cands}`:""}${done?`<div>${done}</div>`:""}`;
+  refreshSide();
 }
 function toggleManual(){ const m=$("#manual"); m.hidden=!m.hidden; }
 function addLine(){ const d=document.createElement("div"); d.className="row";
@@ -303,6 +375,7 @@ function loadEx(k){ const p=JSON.parse(JSON.stringify(examples[k])); p.input_id 
 async function submitPaste(){
   const raw = $("#paste").value;
   let p; try{ p = JSON.parse(raw); }catch(e){ p = {text: raw}; }   // JSON 이 아니면 서버에서 자동 변환
+  if(p.text !== undefined && LLM !== "off") return startDialog(raw);   // 문답 경로(자료 해석 사용 가능 시)
   await doIntake(p);
 }
 async function submitManual(){

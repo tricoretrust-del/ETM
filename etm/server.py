@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import contract, db, learn, plan, process, seed, textparse
+from . import contract, db, dialog, learn, llm, plan, process, seed, textparse
 
 STATIC = Path(__file__).parent / "static"
 
@@ -102,6 +102,31 @@ class App:
             m = re.fullmatch(r"/api/events/(\d+)", path)
             if method == "GET" and m:
                 return 200, process.event_detail(c, int(m[1]))
+            # ---- DEV-004 v0.2 문답 (API 호출은 수 초 걸린다. 단일 사용자 전제로 잠금 안에서 처리)
+            if method == "GET" and path == "/api/dialogs":
+                cfg = llm.config()
+                return 200, {"dialogs": dialog.list_dialogs(c), "provider": cfg["provider"], "model": cfg["model"],
+                             "metrics": dialog.metrics(c)}
+            if method == "POST" and path == "/api/dialogs":
+                return 200, dialog.analyze_input(c, text=(body or {}).get("text", ""), actor=actor)
+            m = re.fullmatch(r"/api/dialogs/(\d+)", path)
+            if method == "GET" and m:
+                return 200, dialog.detail(c, int(m[1]))
+            m = re.fullmatch(r"/api/dialogs/(\d+)/answer", path)
+            if method == "POST" and m:
+                b = body or {}
+                return 200, dialog.answer_question(c, dialog_id=int(m[1]), question_id=int(b["question_id"]),
+                                                   text=b.get("text"), choice=b.get("choice"), actor=actor,
+                                                   expected_revision=b.get("revision"))
+            m = re.fullmatch(r"/api/dialogs/(\d+)/retry", path)
+            if method == "POST" and m:
+                return 200, dialog.retry(c, dialog_id=int(m[1]), actor=actor)
+            m = re.fullmatch(r"/api/candidates/(\d+)/(accept|dismiss)", path)
+            if method == "POST" and m:
+                if m[2] == "accept":
+                    return 200, dialog.accept_candidate(c, candidate_id=int(m[1]), actor=actor)
+                dialog.dismiss_candidate(c, candidate_id=int(m[1]), actor=actor)
+                return 200, {"ok": True}
             if method == "POST" and path == "/api/intake":
                 body = body or {}
                 notes: list[str] = []

@@ -269,6 +269,13 @@ class Robustness(Base):
         with self.assertRaises(Conflict):   # 같은 질문에 두 번 답(중복 요청)
             dialog.answer_question(self.c, dialog_id=d["id"], question_id=qid, choice="KPP 팔레트", actor="owner")
 
+    def test_duplicate_submit_reuses_open_dialog(self):
+        self.queue = [resp()]
+        d1 = dialog.analyze_input(self.c, text=J01, actor="owner")
+        d2 = dialog.analyze_input(self.c, text=J01, actor="owner")
+        self.assertEqual(d1["id"], d2["id"])
+        self.assertEqual(len(self.seen), 1)
+
     def test_reconnect_detail(self):
         """다시 접속해도 문답 상태·질문·답이 DB 에서 그대로 복원된다."""
         self.queue = [resp()]
@@ -306,7 +313,9 @@ class Shipment(Base):
         ev = process.event_detail(self.c, d["event_id"])
         self.assertIn("금성백조", ev["title"])
         # 기존 엔진의 필수 확인(손글씨·팔레트 대조 등)은 사건에 미결로 남는다
-        self.assertTrue(ev["checks"] if "checks" in ev else True)
+        open_checks = [k for k in ev["checks"] if not k.get("answered")]
+        self.assertTrue(ev["checks"], "필수 확인 항목이 만들어져야 함")
+        self.assertTrue(open_checks or ev["status"] != "confirmed", ev["checks"])
 
 
 if __name__ == "__main__":

@@ -149,6 +149,10 @@ def analyze_input(conn, *, text: str, actor: str, company_id: int = 1) -> dict:
     learn.user(conn, actor)
     if not (text or "").strip():
         raise ValueError("입력 내용이 비어 있습니다")
+    same = conn.execute("SELECT id FROM dialog WHERE company_id=? AND raw_input=? AND status IN ('asking','failed')"
+                        " ORDER BY id DESC LIMIT 1", (company_id, text)).fetchone()
+    if same:   # 같은 자료를 다시 보냄(중복 클릭·재접속) → 진행 중인 문답으로 이어 간다. API 재호출 없음
+        return detail(conn, same["id"])
     try:
         ext, _ = textparse.to_payload(text, process.customer_names(conn))
     except ValueError:
@@ -679,3 +683,21 @@ def list_dialogs(conn, company_id=1, limit=30):
     return [dict(r) for r in conn.execute(
         "SELECT id, status, event_id, substr(raw_input,1,60) head, status_reason, updated_at FROM dialog WHERE company_id=?"
         " ORDER BY id DESC LIMIT ?", (company_id, limit))]
+
+
+def metrics(conn, company_id=1) -> dict:
+    """DEV-004 측정: 문답당 질문 수·API 호출·지연·토큰, 규칙이 처리한 판단 수."""
+    ds = conn.execute("SELECT id, status FROM dialog WHERE company_id=?", (company_id,)).fetchall()
+    qs = conn.execute("SELECT COUNT(*) FROM dialog_question q JOIN dialog d ON d.id=q.dialog_id WHERE d.company_id=?"
+                      " AND q.status<>'superseded'", (company_id,)).fetchone()[0]
+    calls = conn.execute("SELECT l.status, l.latency_ms, l.usage FROM llm_call l JOIN dialog d ON d.id=l.dialog_id"
+                         " WHERE d.company_id=?", (company_id,)).fetchall()
+    toks = sum((json.loads(c["usage"]) or {}).get("total_tokens", 0) for c in calls if c["usage"])
+    lat = [c["latency_ms"] for c in calls if c["latency_ms"] is not None]
+    auto = conn.execute("SELECT COUNT(*) FROM rule_application a JOIN event e ON e.id=a.event_id WHERE e.company_id=?"
+                        " AND (a.target='doc_kind' OR a.target LIKE 'lines.%')", (company_id,)).fetchone()[0]
+    return {"dialogs": len(ds), "by_status": {s: sum(1 for d in ds if d["status"] == s) for s in {d["status"] for d in ds}},
+            "questions": qs, "questions_per_dialog": round(qs / len(ds), 2) if ds else 0,
+            "api_calls": len(calls), "api_failed": sum(1 for c in calls if c["status"] != "ok"),
+            "tokens": toks, "latency_avg_ms": int(sum(lat) / len(lat)) if lat else None,
+            "latency_max_ms": max(lat) if lat else None, "rule_decisions": auto}
