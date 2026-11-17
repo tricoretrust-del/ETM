@@ -133,6 +133,8 @@ def normalize(payload: dict) -> tuple[dict, dict]:
         put(f"lines.{i}.item", _str_or_none(ln.get("item"), f"lines.{i}.item", errors, meta))
         put(f"lines.{i}.qty", _num_or_none(ln.get("qty"), f"lines.{i}.qty", errors))
         put(f"lines.{i}.unit", _str_or_none(ln.get("unit"), f"lines.{i}.unit", errors, meta))
+        if ln.get("owner") is not None:   # 임대품 소유자(확인된 경우만): 'own' 또는 'party:<id>'
+            put(f"lines.{i}.owner", _str_or_none(ln.get("owner"), f"lines.{i}.owner", errors, meta))
 
     pallets = payload.get("pallets") or {}
     put("pallets.invoice", _num_or_none(pallets.get("invoice"), "pallets.invoice", errors))

@@ -41,7 +41,7 @@ def facts_for(decision: str, *, supplier: str = "", item_text: str = "", raw: st
     """규칙 조건·사례 키로 쓰는 표준 사실. doc_kind = {상대 업체, 원문 표지}, item_map = {상대 업체, 품목 원문}."""
     if decision == "doc_kind":
         return {"supplier": _norm(supplier), "marker": doc_marker(raw)}
-    if decision == "item_map":
+    if decision in ("item_map", "owner_map"):
         return {"supplier": _norm(supplier), "item_text": _norm(item_text)}
     raise ValueError(f"사실을 만들 수 없는 판단 종류: {decision}")
 
@@ -67,7 +67,7 @@ def facts_from_key(kind, key):
         return json.loads(key)
     if kind == "doc_kind":
         return {"form_key": key}
-    if kind == "item_map":
+    if kind in ("item_map", "owner_map"):
         sup, _, item = (key or "").partition("|")
         return {"supplier": sup, "item_text": item}
     return {}
@@ -77,13 +77,14 @@ def require_specific(decision: str, condition: dict) -> None:
     """범위가 사실상 '모든 자료'가 되는 규칙은 만들지 않는다."""
     if decision == "doc_kind" and not (condition.get("supplier") or condition.get("form_key")):
         raise Conflict("상대 업체가 확정되지 않은 사례라 규칙 범위를 정할 수 없습니다")
-    if decision == "item_map" and not condition.get("item_text"):
+    if decision in ("item_map", "owner_map") and not condition.get("item_text"):
         raise Conflict("품목 원문이 없어 규칙 범위를 정할 수 없습니다")  # 후보 제시 기준(잠정). 승격 기준 자체는 LAG-001 / TRNK 결정 사항
 
 DECISIONS = {
     "doc_kind": {"label": "자료 종류(가치 이동 방향)", "event_kind": "intake"},
     "item_map": {"label": "입고 품목 연결", "event_kind": "receipt"},
     "pallet_check": {"label": "출하 팔레트 대조", "event_kind": "shipment"},
+    "owner_map": {"label": "임대품 소유자", "event_kind": "receipt"},
 }
 SCOPE_KEYS = ("party_id", "site_id", "item_id")
 ROLE_CAN_APPROVE = {"approver", "admin"}
@@ -138,6 +139,12 @@ def validate_action(conn, decision: str, action: dict) -> dict:
         if action.get("on_match") not in ("accept", "require_confirm") or action.get("on_mismatch") != "require_confirm":
             raise ValueError("compare_pallets: on_match=accept|require_confirm, on_mismatch=require_confirm")
         return {"type": t, "on_match": action["on_match"], "on_mismatch": "require_confirm"}
+    if decision == "owner_map" and t == "set_owner":
+        o = action.get("owner")
+        if o != "own" and not (isinstance(o, str) and o.startswith("party:")
+                               and conn.execute("SELECT 1 FROM party WHERE id=?", (int(o[6:]),)).fetchone()):
+            raise ValueError("set_owner: owner 는 'own' 또는 존재하는 'party:<id>'")
+        return {"type": t, "owner": o, "label": action.get("label")}
     if decision == "doc_kind" and t == "set_doc_kind":
         from .contract import DOC_KIND_CHOICES
         if action.get("value") not in DOC_KIND_CHOICES:
@@ -435,6 +442,8 @@ def _action_from_answer(kind, answer):
         return {"type": "set_doc_kind", "value": answer}
     if kind == "item_map":
         return {"type": "map_item", "choice": answer["choice"], "label": answer.get("label")}
+    if kind == "owner_map":
+        return {"type": "set_owner", "owner": answer["owner"], "label": answer.get("label")}
     raise ValueError("이 판단은 사례로부터 동작을 만들 수 없습니다")
 
 

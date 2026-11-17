@@ -469,13 +469,29 @@ def _gate_and_apply(conn, did, pid):
         return
     state["kind"] = known
     kind = known["value"]
+    cp = state.get("counterparty")
+    if not cp and pp.get("counterparty"):
+        if norm(pp["counterparty"]) and norm(pp["counterparty"]) in norm(d["raw_input"]):
+            cp = {"value": pp["counterparty"], "source": "document_name"}   # 모델이 읽은 이름이 원문에 그대로 있음
+        elif kind in ("receipt", "shipment"):
+            _set_state(conn, did, state)
+            _ask(conn, did, d["revision"], "srv-counterparty", "counterparty", "confirm_inference",
+                 f"상대 업체가 '{pp['counterparty']}'가 맞나요? (원문에 그대로 적혀 있지 않음)", ["맞음"],
+                 pp["counterparty"], "server")
+            return
+    conf = {"kind": _ev(known), "counterparty": _ev(cp)}
     if kind == "receipt":
         for i, ln in enumerate(pp.get("lines") or []):
-            if ln.get("qty") is None:
+            # 칸별 확정: 수량 → 품목 → (임대품이면) 소유자. 각 칸은 그 칸을 확정할 수 있는 근거로만 채운다(SLOT_EVIDENCE)
+            qk = _qty_known(d, ln, i, state)
+            if not qk:
                 _set_state(conn, did, state)
-                _ask(conn, did, d["revision"], f"srv-qty-{i}", f"lines.{i}.qty", "missing",
-                     f"'{ln['item_text']}' 수량은 얼마인가요?", [], None, "server")
+                q = ln.get("qty")
+                _ask(conn, did, d["revision"], f"srv-qty-{i}", f"lines.{i}.qty", "confirm_inference" if q is not None else "missing",
+                     f"'{ln['item_text']}' 수량이 {_fmt(q)}개가 맞나요? (원문에서 확인되지 않음)" if q is not None
+                     else f"'{ln['item_text']}' 수량은 얼마인가요?", ["맞음"] if q is not None else [], _fmt(q) if q is not None else None, "server")
                 return
+            conf[f"lines.{i}.qty"] = _ev(qk)
             ik = _item_known(conn, ln, i, state, d["company_id"], pp.get("counterparty") or "")
             if not ik:
                 _set_state(conn, did, state)
@@ -485,8 +501,89 @@ def _gate_and_apply(conn, did, pid):
                      f"'{ln['item_text']}'은(는) 어떤 품목인가요?" + (" (추정 제시)" if prop else ""), opts, prop, "server")
                 return
             state.setdefault("items", {})[str(i)] = ik
+            conf[f"lines.{i}.item"] = _ev(ik)
+            ok = _owner_known(conn, d, pp, ln, i, state, ik)
+            if ok is False:
+                continue                  # 임대품 아님 → 소유자 칸 없음
+            if not ok:
+                _set_state(conn, did, state)
+                item = conn.execute("SELECT * FROM item WHERE id=?", (int(ik["choice"].split(":")[1]),)).fetchone()
+                mo = conn.execute("SELECT name FROM party WHERE id=?", (item["owner_party_id"],)).fetchone()
+                opts = [x for x in (mo["name"] if mo else None, pp.get("counterparty")) if x] + ["자사"]
+                _ask(conn, did, d["revision"], f"srv-owner-{i}", f"lines.{i}.owner", "missing",
+                     f"{pp.get('counterparty')}에서 온 '{item['name']}' {_fmt(qk['value'])}개는 누구 소유인가요?",
+                     list(dict.fromkeys(opts)), None, "server")
+                return
+            state.setdefault("owners", {})[str(i)] = ok
+            conf[f"lines.{i}.owner"] = _ev(ok)
+    state["confirmations"] = conf
     _set_state(conn, did, state)
     _apply(conn, did, pid, pp, state)
+
+
+# 근거별 확정 범위 — 근거가 확정할 수 있는 칸(이 밖의 칸은 그 근거로 채우지 않는다)
+SLOT_EVIDENCE = {
+    "document": "원문 종류 표기 → 문서가 주장하는 이동 종류",
+    "document_name": "원문에 적힌 알려진 업체명 → 상대 업체",
+    "document_value": "원문에 적힌 숫자 → 그 줄의 수량",
+    "master_exact": "기준정보 이름·코드·별칭 정확 일치 → 품목(수량·방향·소유자는 아님)",
+    "sender_is_owner": "보낸 업체가 그 임대품의 등록 소유자 → 소유자",
+    "user_answer": "이번 문답의 사용자 답 → 그 질문의 칸, 이 사건에 한함",
+    "rbk": "승인된 활성 규칙 → 조건이 맞는 범위에서 규칙이 다루는 칸",
+}
+
+
+def _ev(s):
+    if not s:
+        return None
+    v = s.get("value", s.get("choice"))
+    out = {"value": v, "evidence": s.get("source")}
+    if s.get("rule_version_id"):
+        out["rule_version_id"] = s["rule_version_id"]
+    if s.get("answer_id"):
+        out["answer_id"] = s["answer_id"]
+    return out
+
+
+def _fmt(q):
+    return None if q is None else (str(int(q)) if float(q).is_integer() else str(q))
+
+
+def _qty_known(d, ln, i, state):
+    s = (state.get("qty") or {}).get(str(i))
+    if s:
+        return s
+    q = ln.get("qty")
+    if q is None:
+        return None
+    digits = _fmt(q)
+    raw = d["raw_input"].replace(",", "")
+    if re.search(rf"(?<![\d.]){re.escape(digits)}(?![\d])", raw):
+        return {"value": float(q), "source": "document_value"}
+    return None   # 모델이 읽은 수가 원문에 없다 → 확인
+
+
+def _owner_known(conn, d, pp, ln, i, state, ik):
+    """임대품 소유자. False=임대품 아님(칸 없음), None=모름(질문), dict=확정."""
+    if ik["choice"] in (NO_EFFECT_ITEM, None) or not str(ik["choice"]).startswith("item:"):
+        return False
+    item = conn.execute("SELECT * FROM item WHERE id=?", (int(ik["choice"].split(":")[1]),)).fetchone()
+    if not item or item["kind"] != "rental":
+        return False
+    s = (state.get("owners") or {}).get(str(i))
+    if s:
+        return s
+    facts = learn.facts_for("owner_map", supplier=pp.get("counterparty") or "", item_text=ln["item_text"])
+    status, action, ver, basis = learn.decide(conn, event={"company_id": d["company_id"], "trade_date": None},
+                                              decision="owner_map", facts=facts)
+    if status == "rule":
+        return {"value": action["owner"], "source": "rbk", "rule_version_id": ver["id"], "basis": basis}
+    if item["owner_party_id"]:
+        p = conn.execute("SELECT name, aliases FROM party WHERE id=?", (item["owner_party_id"],)).fetchone()
+        names = {norm(x) for x in [p["name"], *json.loads(p["aliases"] or "[]")] if x}
+        if norm(pp.get("counterparty") or "") in names:
+            return {"value": f"party:{item['owner_party_id']}", "source": "sender_is_owner"}
+    return None
 
 
 def _resolve_server_answer(conn, q, choice, text, state, aid) -> bool:
@@ -495,6 +592,8 @@ def _resolve_server_answer(conn, q, choice, text, state, aid) -> bool:
         return False
     val = (choice or text or "").strip()
     if q["target"] == "counterparty":
+        if q["proposed"] and (YES.match(val) or YES_PREFIX.match(val)):
+            val = q["proposed"]
         if val:
             state["counterparty"] = {"value": val, "source": "user_answer", "answer_id": aid}
             return True
@@ -521,7 +620,26 @@ def _resolve_server_answer(conn, q, choice, text, state, aid) -> bool:
             state.setdefault("items", {})[idx] = {"choice": f"item:{r['id']}", "source": "user_answer", "answer_id": aid}
             return True
         return False
+    m = re.fullmatch(r"lines\.(\d+)\.owner", q["target"])
+    if m and val:
+        if val == "자사":
+            owner, label = "own", "자사"
+        else:
+            r = conn.execute("SELECT id, name FROM party WHERE name=?", (val,)).fetchone() or next(
+                (x for x in conn.execute("SELECT id, name, aliases FROM party")
+                 if norm(val) in [norm(y) for y in [x["name"], *json.loads(x["aliases"] or "[]")]]), None)
+            if r is None:   # 처음 보는 소유 업체: 사용자 답을 근거로 거래 상대 기준정보에 추가(기록 남김)
+                pid_ = conn.execute("INSERT INTO party(name, kind, aliases, is_test) VALUES (?, 'lessor', '[]', 0)",
+                                    (val,)).lastrowid
+                process.log(conn, None, "master", f"거래 상대 추가: {val} (문답 답변 #{aid})")
+                r = {"id": pid_, "name": val}
+            owner, label = f"party:{r['id']}", r["name"]
+        state.setdefault("owners", {})[m[1]] = {"value": owner, "label": label, "source": "user_answer", "answer_id": aid}
+        return True
     m = re.fullmatch(r"lines\.(\d+)\.qty", q["target"])
+    if m and q["proposed"] and (YES.match(val) or YES_PREFIX.match(val)):
+        state.setdefault("qty", {})[m[1]] = {"value": float(q["proposed"]), "source": "user_answer", "answer_id": aid}
+        return True
     if m and re.fullmatch(r"\d+(\.\d+)?", val.replace(",", "")):
         state.setdefault("qty", {})[m[1]] = {"value": float(val.replace(",", "")), "source": "user_answer", "answer_id": aid}
         return True
@@ -592,7 +710,9 @@ def _apply(conn, did, pid, pp, state):
                 name = r["name"]
         elif s and s["choice"] == NO_EFFECT_ITEM:
             continue
-        lines.append({"item": name, "qty": ln.get("qty"), "unit": ln.get("unit")})
+        o = (state.get("owners") or {}).get(str(i))
+        lines.append({"item": name, "qty": ln.get("qty"), "unit": ln.get("unit"),
+                      **({"owner": o["value"]} if o else {})})
     if pp.get("lines"):
         p["lines"] = lines
     if meta:
@@ -610,7 +730,8 @@ def _apply(conn, did, pid, pp, state):
     res = process._intake_tx(conn, p)
     ev = res["event_id"]
     conn.execute("UPDATE dialog_proposal SET status='applied', event_id=?, validation=? WHERE id=?",
-                 (ev, jdump({"payload": p, "outcome": res["outcome"]}), pid))
+                 (ev, jdump({"payload": p, "outcome": res["outcome"],
+                             "confirmations": state.get("confirmations") or {}}), pid))
     conn.execute("UPDATE dialog SET status=?, event_id=?, updated_at=? WHERE id=?",
                  ("kept" if doc_type == "other" else "applied", ev, now(), did))
     # 학습 기록: 확정 사례 (사건의 사실. 자동 일반 규칙 아님)
@@ -649,6 +770,19 @@ def _apply(conn, did, pid, pp, state):
                                    answer={"choice": s["choice"], "label": lab}, actor=d["created_by"],
                                    company_id=d["company_id"])
             conn.execute("UPDATE decision_case SET dialog_id=? WHERE id=?", (did, c2))
+    for i, s in (state.get("owners") or {}).items():
+        ln = pp["lines"][int(i)]
+        f = learn.facts_for("owner_map", supplier=pp.get("counterparty") or "", item_text=ln["item_text"])
+        if s.get("source") == "rbk":
+            learn.record_application(conn, event_id=ev, version_id=s["rule_version_id"], target=f"lines.{i}.owner",
+                                     basis={**(s.get("basis") or {}), "dialog": did}, snapshot={"item": ln["item_text"]},
+                                     result="performed", reason=s["value"])
+        if s.get("source") == "user_answer":
+            c3 = learn.record_case(conn, event_id=ev, check_id=None, kind="owner_map", key=learn.case_key(f),
+                                   label=f"{pp.get('counterparty') or ''} 자료 '{ln['item_text']}'의 소유자",
+                                   answer={"owner": s["value"], "label": s.get("label")}, actor=d["created_by"],
+                                   company_id=d["company_id"])
+            conn.execute("UPDATE decision_case SET dialog_id=? WHERE id=?", (did, c3))
     process.log(conn, ev, "dialog", f"문답 #{did}로 처리 · {KIND_LABEL[kind]}"
                 + (" · 규칙 적용" if k["source"] == "rbk" else ""))
 

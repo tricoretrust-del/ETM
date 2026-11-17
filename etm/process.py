@@ -1208,9 +1208,10 @@ def summary(conn) -> dict:
         " LEFT JOIN site s ON m.to_loc = 'site:' || s.id LEFT JOIN party p ON m.to_loc = 'party:' || p.id"
         " WHERE m.owner LIKE 'party:%' AND m.to_loc <> 'factory' GROUP BY m.to_loc HAVING SUM(m.qty) <> 0")]
     rental_factory = [dict(r) for r in conn.execute(
-        "SELECT i.name, i.unit, SUM(CASE WHEN m.to_loc='factory' THEN m.qty ELSE 0 END)"
+        "SELECT i.name, i.unit, m.owner, p.name owner_name, SUM(CASE WHEN m.to_loc='factory' THEN m.qty ELSE 0 END)"
         " - SUM(CASE WHEN m.from_loc='factory' THEN m.qty ELSE 0 END) qty FROM value_move m JOIN item i ON i.id=m.item_id"
-        " WHERE m.owner LIKE 'party:%' GROUP BY i.id HAVING qty <> 0")]
+        " LEFT JOIN party p ON m.owner = 'party:' || p.id"
+        " WHERE m.owner LIKE 'party:%' GROUP BY i.id, m.owner HAVING qty <> 0")]   # 소유자별로 나눠 보인다
     claims = [dict(r) for r in conn.execute(
         "SELECT c.kind, c.role, c.party_name, c.amount, c.settled, c.event_id FROM money_claim c"
         " JOIN event e ON e.id=c.event_id WHERE c.state='active' AND e.status='active'"

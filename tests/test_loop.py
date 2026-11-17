@@ -12,20 +12,24 @@ NO_MARK = "LOGISALL 전표 A{n}\n유형: P10\n수량: {q}"     # 원문에 종�
 
 
 class Loop(Base):
-    def ask_until_done(self, text, kind_choice="입고"):
-        self.queue.append(resp(status="ready_for_validation", action="none", kind_source="none", hyp="unknown"))
+    def ask_until_done(self, text, kind_choice="입고", owner="KPP"):
+        import re
+        q_ = float(re.search(r"수량: (\d+)", text)[1])
+        self.queue.append(resp(status="ready_for_validation", action="none", kind_source="none", hyp="unknown",
+                               lines=[line(qty=q_)]))
         d = dialog.analyze_input(self.c, text=text, actor="owner")
         asked = []
         while d["open_question"]:
             q = d["open_question"]
             asked.append(q["target"])
-            d = self.answer(d, choice=kind_choice if q["target"] == "kind" else "KPP 팔레트")
+            d = self.answer(d, choice=kind_choice if q["target"] == "kind" else
+                            owner if q["target"].endswith(".owner") else "KPP 팔레트")
         return d, asked
 
-    def full_cycle(self, decision):
+    def full_cycle(self, decision, owner="KPP"):
         """같은 판단의 사례 3건 → 후보 → LAG → PLN(실행·완료) → 검증 → 판정 → 승인. 규칙 버전을 돌려준다."""
         for n in (1, 2, 3):
-            d, asked = self.ask_until_done(NO_MARK.format(n=n, q=10 * n))
+            d, asked = self.ask_until_done(NO_MARK.format(n=n, q=10 * n), owner=owner)
             self.assertEqual(d["status"], "applied")
             self.assertIn("kind", asked)
         cand = next(x for x in learn.candidates(self.c) if x["decision"] == decision)
@@ -56,7 +60,8 @@ class Loop(Base):
         ev = process.event_detail(self.c, d["event_id"])
         self.assertIn(f"{v['rule_id']} v1", [a["rule"] for a in ev["rule_applications"]])
         # 같은 업체라도 원문에 '반납' 표지가 있으면 이 규칙(표지 없음)은 맞지 않는다
-        self.queue.append(resp(status="ready_for_validation", action="none", kind_source="none", hyp="unknown"))
+        self.queue.append(resp(status="ready_for_validation", action="none", kind_source="none", hyp="unknown",
+                               lines=[line(qty=3)]))
         d2 = dialog.analyze_input(self.c, text="반납전표\n" + NO_MARK.format(n=8, q=3), actor="owner")
         self.assertEqual(d2["open_question"]["target"], "kind")
 
@@ -109,15 +114,90 @@ class Migration0007(Base):
 
 class Counterparty(Base):
     def test_empty_counterparty_asked_then_known_from_cases(self):
-        self.queue.append(resp(counterparty=None))
+        self.queue.append(resp(counterparty=None, lines=[line(qty=1)]))
         d = dialog.analyze_input(self.c, text=NO_MARK.format(n=1, q=1), actor="owner")
         self.assertEqual(d["open_question"]["target"], "counterparty")
         d = self.answer(d, text="LOGISALL")
         while d["open_question"]:
-            d = self.answer(d, choice="입고" if d["open_question"]["target"] == "kind" else "KPP 팔레트")
+            t = d["open_question"]["target"]
+            d = self.answer(d, choice="입고" if t == "kind" else "KPP" if t.endswith(".owner") else "KPP 팔레트")
         self.assertEqual(d["status"], "applied")
         # 다음 자료: 모델이 또 비워도, 원문에 적힌 이름이 확정 사례의 업체와 같으면 묻지 않는다
-        self.queue.append(resp(counterparty=None))
+        self.queue.append(resp(counterparty=None, lines=[line(qty=2)]))
         d2 = dialog.analyze_input(self.c, text=NO_MARK.format(n=2, q=2), actor="owner")
         self.assertNotEqual((d2["open_question"] or {}).get("target"), "counterparty")
         self.assertEqual(d2["state"]["counterparty"]["source"], "document_name")
+
+
+class Slots(Base):
+    """② 근거별 확정 범위: 근거는 자기가 확정할 수 있는 칸만 채운다."""
+
+    def conf(self, d):
+        v = self.c.execute("SELECT validation FROM dialog_proposal WHERE dialog_id=? AND status='applied'",
+                           (d["id"],)).fetchone()[0]
+        return json.loads(v)["confirmations"]
+
+    def test_model_qty_not_in_document_is_confirmed(self):
+        self.queue = [resp(lines=[line(qty=97)])]
+        d = dialog.analyze_input(self.c, text=NO_MARK.format(n=1, q=10).replace("LOGISALL 전표", "LOGISALL 입고 전표"),
+                                 actor="owner")
+        q = d["open_question"]
+        self.assertEqual((q["target"], q["proposed"]), ("lines.0.qty", "97"))
+        d = self.answer(d, text="10")
+        d = self.finish(self.answer(d, choice="KPP 팔레트"))
+        self.assertEqual(d["status"], "applied")
+        self.assertEqual(self.conf(d)["lines.0.qty"], {"value": 10.0, "evidence": "user_answer",
+                                                        "answer_id": d["answers"][0]["id"]})
+
+    def test_evidence_per_slot(self):
+        self.queue = [resp()]
+        from tests.test_dev004 import J01
+        d = dialog.analyze_input(self.c, text=J01, actor="owner")
+        d = self.finish(self.answer(d, choice="KPP 팔레트"), owner="KPP")
+        c = self.conf(d)
+        self.assertEqual(c["kind"]["evidence"], "document")           # '입고' 표기 → 종류만
+        self.assertEqual(c["lines.0.qty"]["evidence"], "document_value")  # 원문 숫자 → 수량만
+        self.assertEqual(c["lines.0.item"]["evidence"], "user_answer")    # 사용자 답 → 품목
+        self.assertEqual(c["lines.0.owner"]["evidence"], "user_answer")   # 소유자는 따로 확인
+
+    def test_master_exact_confirms_item_only(self):
+        """기준정보 정확 일치는 품목만 확정. 보낸 업체가 등록 소유자(KPP)면 소유자도 확정(근거 다름)."""
+        self.queue = [resp(counterparty="KPP", lines=[line("KPP 팔레트", 30)])]
+        d = dialog.analyze_input(self.c, text="KPP 입고전표\n품목: KPP 팔레트\n수량: 30", actor="owner")
+        self.assertEqual(d["status"], "applied", d["open_question"])
+        c = self.conf(d)
+        self.assertEqual(c["lines.0.item"]["evidence"], "master_exact")
+        self.assertEqual(c["lines.0.owner"]["evidence"], "sender_is_owner")
+
+    def test_owner_answer_changes_ledger_owner(self):
+        before = self.factory_kpp()
+        self.queue = [resp(lines=[line(qty=20)])]
+        d = dialog.analyze_input(self.c, text="LOGISALL 입고전표\n유형: P10\n수량: 20", actor="owner")
+        d = self.answer(d, choice="KPP 팔레트")
+        self.assertEqual(d["open_question"]["target"], "lines.0.owner")
+        self.assertIn("LOGISALL", d["open_question"]["options"])
+        d = self.answer(d, choice="LOGISALL")
+        self.assertEqual(d["status"], "applied")
+        pid_ = self.c.execute("SELECT id FROM party WHERE name='LOGISALL'").fetchone()[0]
+        mv = self.c.execute("SELECT owner, qty FROM value_move WHERE event_id=?", (d["event_id"],)).fetchone()
+        self.assertEqual((mv["owner"], mv["qty"]), (f"party:{pid_}", 20))
+        self.assertEqual(self.factory_kpp(), before, "KPP 소유 수량에 섞이지 않음")
+
+
+class OwnerLoop(Loop):
+    def test_owner_map_loop_closes(self):
+        v = self.full_cycle("owner_map", owner="LOGISALL")
+        pid_ = self.c.execute("SELECT id FROM party WHERE name='LOGISALL'").fetchone()[0]
+        self.assertEqual(json.loads(v["action"])["owner"], f"party:{pid_}")
+        d, asked = self.ask_until_done(NO_MARK.format(n=9, q=7), owner="LOGISALL")
+        self.assertNotIn("lines.0.owner", asked)
+        ev = process.event_detail(self.c, d["event_id"])
+        self.assertIn(f"{v['rule_id']} v1", [a["rule"] for a in ev["rule_applications"]])
+
+
+class CounterpartyEvidence(Base):
+    def test_counterparty_not_in_document_is_confirmed(self):
+        self.queue = [resp(counterparty="로지스올", lines=[line(qty=5)])]
+        d = dialog.analyze_input(self.c, text="입고전표\n유형: P10\n수량: 5", actor="owner")
+        q = d["open_question"]
+        self.assertEqual((q["target"], q["proposed"]), ("counterparty", "로지스올"))

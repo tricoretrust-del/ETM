@@ -139,7 +139,8 @@ def reconcile(conn, event_id) -> dict:
             pending.append(i)
             continue
         item = conn.execute("SELECT * FROM item WHERE id=?", (it["ref"],)).fetchone()
-        owner = "own" if item["kind"] == "product" else f"party:{item['owner_party_id']}"
+        ow = (fields.get(f"lines.{i}.owner") or {}).get("value")
+        owner = ow or ("own" if item["kind"] == "product" else f"party:{item['owner_party_id']}")
         key = (item["id"], src, "factory", owner)
         desired[key] = desired.get(key, 0) + q["value"]
         applied.append(i)

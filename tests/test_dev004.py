@@ -76,7 +76,14 @@ class Base(unittest.TestCase):
         return self.c.execute("SELECT id FROM item WHERE code='KPP-PLT'").fetchone()[0]
 
     def factory_kpp(self):
-        return [r["qty"] for r in process.summary(self.c)["rental_factory"] if r["name"] == "KPP 팔레트"][0]
+        return sum(r["qty"] for r in process.summary(self.c)["rental_factory"]
+                   if r["name"] == "KPP 팔레트" and r["owner_name"] == "KPP")
+
+    def finish(self, d, owner="KPP"):
+        """남은 소유자 확인 질문에 답한다(LOGISALL 이 보낸 KPP 팔레트: 보낸 업체 ≠ 등록 소유자 → 소유자 칸 확인)."""
+        while d["open_question"] and d["open_question"]["target"].endswith(".owner"):
+            d = self.answer(d, choice=owner)
+        return d
 
     def answer(self, d, text=None, choice=None):
         qq = d["open_question"]
@@ -94,6 +101,8 @@ class J01Flow(Base):
         d = dialog.analyze_input(self.c, text=J01, actor="owner")
         self.assertEqual(d["open_question"]["target"], "lines.0.item")
         d = self.answer(d, choice="KPP 팔레트")
+        self.assertEqual(d["open_question"]["target"], "lines.0.owner")
+        d = self.finish(d)
         self.assertEqual(d["status"], "applied")
         self.assertEqual(self.factory_kpp(), before + 97)
         self.assertEqual([s["qty"] for s in process.summary(self.c)["stock"]], before_stock)
@@ -109,6 +118,7 @@ class J01Flow(Base):
         d = dialog.analyze_input(self.c, text=J01, actor="owner")
         d = self.answer(d, text="맞아. 다음에도 LOGISALL P10은 KPP 팔레트야")
         # '맞아.' 만으로는 대상이 없으므로(제시값 없음) API 해석으로 넘어간다
+        d = self.finish(d)
         self.assertEqual(d["status"], "applied", d)
         cand = [x for x in d["candidates"] if x["explicit_instruction"]]
         self.assertEqual(len(cand), 1)
@@ -118,7 +128,9 @@ class J01Flow(Base):
         self.queue = [resp(lines=[line(qty=50, ref=f"item:{kpp}", src="rbk")])]
         d2 = dialog.analyze_input(self.c, text=J01.replace("A14884061", "A14884062").replace("97", "50")
                                   + "\n9. 비고: 오전", actor="owner")
-        self.assertIsNone(d2["open_question"])
+        # 품목은 규칙으로 처리되고, 소유자는 별도 칸(규칙 없음)이라 따로 묻는다
+        self.assertEqual(d2["open_question"]["target"], "lines.0.owner")
+        d2 = self.finish(d2)
         self.assertEqual(d2["status"], "applied")
         ev = process.event_detail(self.c, d2["event_id"])
         self.assertIn(f"{r['rule_id']} v1", [a["rule"] for a in ev["rule_applications"]])
@@ -143,8 +155,9 @@ class Counterexamples(Base):
                                            "explicit_user_instruction": True}])]
         d = dialog.analyze_input(self.c, text=J01, actor="owner")
         d = self.answer(d, text="KPP 팔레트야. 앞으로 LOGISALL 자료는 입고로 처리해")
-        if d["open_question"]:
+        if d["open_question"] and d["open_question"]["target"].endswith(".item"):
             d = self.answer(d, choice="KPP 팔레트")
+        d = self.finish(d)
         cand = [x for x in d["candidates"] if x["explicit_instruction"]][0]
         r = dialog.accept_candidate(self.c, candidate_id=cand["id"], actor="owner")
         return self.c.execute("SELECT id FROM rule_version WHERE rule_id=?", (r["rule_id"],)).fetchone()[0]
@@ -175,7 +188,7 @@ class Counterexamples(Base):
         """처리안이 P10 을 여러 줄로 쪼개 와도 원문 한 줄 → 질문은 원문 품목 기준."""
         self.queue = [resp(lines=[line()])]
         d = dialog.analyze_input(self.c, text=J01, actor="owner")
-        d = self.answer(d, choice="KPP 팔레트")
+        d = self.finish(self.answer(d, choice="KPP 팔레트"))
         p = json.loads(self.c.execute("SELECT validation FROM dialog_proposal WHERE dialog_id=? AND status='applied'",
                                       (d["id"],)).fetchone()[0])["payload"]
         self.assertEqual(len(p["lines"]), 1)
@@ -187,6 +200,7 @@ class Counterexamples(Base):
         self.assertEqual(d["open_question"]["target"], "lines.0.qty")
         d = self.answer(d, text="40")
         d = self.answer(d, choice="KPP 팔레트")
+        d = self.finish(d)
         self.assertEqual(d["status"], "applied")
         ev = process.event_detail(self.c, d["event_id"])
         self.assertIn("40", ev["title"])
