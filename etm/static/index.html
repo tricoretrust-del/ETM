@@ -81,11 +81,16 @@ async function refreshSide(){
   const [s, h] = await Promise.all([api("/api/summary"), api("/api/history")]);
   const stock = s.stock.map(x => `${esc(x.name)} ${x.qty.toLocaleString()}${esc(x.unit)}`).join(" · ");
   const pal = s.pallets_out.reduce((a,x)=>a+x.qty,0);
+  const palF = (s.rental_factory||[]).reduce((a,x)=>a+x.qty,0);
+  let rules = {proposals:0, stats:{asked:0, auto:0}};
+  try{ rules = await api("/api/rules"); }catch(e){}
   $("#sum").innerHTML =
     `<span title="${esc(stock)}">재고 ${s.stock.length}품목 <button onclick="showStock()">보기</button></span>`+
     `<span>받을 돈 ${won(s.receivable.known)}${s.receivable.undetermined_count?` + 미확정 ${s.receivable.undetermined_count}건`:""}</span>`+
     `<span>줄 돈 ${won(s.payable.known)}${s.payable.undetermined_count?` + 미확정 ${s.payable.undetermined_count}건`:""}</span>`+
-    `<span>팔레트 현장 ${pal}개</span>`;
+    `<span>팔레트 공장 ${palF} · 현장 ${pal}</span>`+
+    `<span><button onclick="showRules()">룰북·커리큘럼</button>${rules.proposals?` <b style="color:var(--warn)">제안 ${rules.proposals}</b>`:""}`+
+    ` <span title="사용자에게 물은 판단 / 규칙이 처리한 판단">물음 ${rules.stats.asked} · 자동 ${rules.stats.auto}</span></span>`;
   window._summary = s;
   if(!h.days.length){ $("#hist").innerHTML = '<div class="empty">아직 처리한 기록이 없습니다.</div>'; return; }
   $("#hist").className = "";
@@ -106,6 +111,36 @@ function showStock(){
     (s.claims.map(c=>`<tr><td>${c.kind==="receivable"?"받을 돈":"줄 돈"} · ${esc(c.party_name)}</td><td><button class="link" onclick="openEvent(${c.event_id})">${won(c.amount)}</button></td></tr>`).join("") || `<tr><td colspan=2>없음</td></tr>`)+
     `</table><div class="row"><button onclick="home()">닫기</button></div></div>`;
 }
+
+// ---------------- 룰북·커리큘럼
+async function showRules(){
+  current = null;
+  const o = await api("/api/rules");
+  const learned = o.rules.filter(r=>r.decision_kind), base = o.rules.filter(r=>!r.decision_kind);
+  const st = {proposed:"규칙 제안", collecting:"학습 중", conflict:"판정 엇갈림", open:"과제"};
+  $("#left").innerHTML = `<div class="row" style="margin:0 0 8px"><button class="link" onclick="home()">← 새 자료</button></div>
+  <div class="card"><div class="title">판단 위임 현황</div>
+    <div class="meta">규칙이 없는 판단은 모두 사용자에게 묻습니다. 같은 답이 ${o.promote_after}번 쌓이면 규칙을 제안하고, 승인하면 그 뒤로는 묻지 않습니다.</div>
+    <div style="margin-top:6px">사용자에게 물은 판단 <b>${o.stats.asked}</b>건 · 규칙이 처리한 판단 <b>${o.stats.auto}</b>건</div></div>
+  <div class="card"><div class="title">커리큘럼 (학습·제안)</div>
+    ${o.curriculum.length?o.curriculum.map(c=>`<div class="${c.state==="proposed"?"check":""}" style="padding:6px 0;border-bottom:1px solid var(--line)">
+      <span class="chip ${c.state==="proposed"?"open":""}">${st[c.state]||esc(c.state)}</span> ${esc(c.title.replace(/^[^:]+: /,""))}
+      <div class="meta">${esc(c.evidence)}${c.decision_kind&&c.state!=="open"?` · ${c.case_count}/${o.promote_after}`:""} · ${esc(c.next_check)}</div>
+      ${c.state==="proposed"?`<div class="row"><button class="primary" onclick="approveRule(${c.id})">규칙으로 승인</button><span class="meta">승인 전까지는 계속 묻습니다</span></div>`:""}
+    </div>`).join(""):'<div class="empty">아직 없습니다.</div>'}
+  </div>
+  <div class="card"><div class="title">룰북 — 학습된 규칙</div>
+    ${learned.length?learned.map(r=>`<div style="padding:6px 0;border-bottom:1px solid var(--line)"><b>${esc(r.id)}</b> <span class="chip ${r.status==="active"?"done":""}">${esc(r.status)}</span>
+      ${esc(r.condition)} → <b>${esc(r.action)}</b><div class="meta">${esc(r.basis)} · 적용 ${r.case_count}건</div>
+      ${r.status==="active"?`<button class="link" onclick="suspendRule('${esc(r.id)}')">중지(다시 묻기)</button>`:""}</div>`).join(""):'<div class="empty">아직 없습니다.</div>'}
+  </div>
+  <div class="card"><div class="title">룰북 — 기본 규칙</div>
+    ${base.map(r=>`<div class="meta" style="padding:3px 0"><b>${esc(r.id)}</b> ${esc(r.condition)} → ${esc(r.action)} <span>(${esc(r.basis)})</span></div>`).join("")}
+  </div><div class="err" id="err"></div>`;
+  await refreshSide();
+}
+async function approveRule(id){ try{ await api("/api/rules/approve",{curriculum_id:id}); await showRules(); }catch(e){ $("#err").textContent=e.message; } }
+async function suspendRule(id){ try{ await api("/api/rules/suspend",{rule_id:id}); await showRules(); }catch(e){ $("#err").textContent=e.message; } }
 
 // ---------------- 왼쪽: 새 자료
 function home(msg){
@@ -159,6 +194,7 @@ async function openEvent(id, note){
   current = id;
   const d = await api(`/api/events/${id}`);
   if(d.status==="merged") return openEvent(d.merged_into, `#${id} 자료는 이 기록에 연결되었습니다.`);
+  if(d.status==="pending") note = [note, "자료 종류가 정해질 때까지 아무것도 반영하지 않습니다."].filter(Boolean).join("\n");
   if(d.status==="held") note = [note, "이 문서 종류는 아직 처리 기능이 없어 원본과 변환 결과만 보관했습니다. 재고·돈에는 반영하지 않았습니다."].filter(Boolean).join("\n");
   const f = d.fields, v = p => f[p] ? f[p].value : null;
   readOnly = d.status !== "active";
@@ -173,10 +209,10 @@ async function openEvent(id, note){
     <div class="err" id="err"></div>
     <details ${d.checks.length?"":"open"}><summary>내용·수정</summary>
       <table>
-        ${readOnly ? row("보낸 업체",v("supplier"))+row("받은 곳",v("receiver")) : row("거래처",v("customer"),"customer")+row("현장",v("site"),"site")}
+        ${(readOnly || f["supplier"]?.value) ? row("보낸 업체",v("supplier"))+row("받은 곳",v("receiver")) : row("거래처",v("customer"),"customer")+row("현장",v("site"),"site")}
         ${row("담당자",[v("contact.name"),v("contact.phone")].filter(Boolean).join(" "),"contact.name")}
         ${lines.map(i=>row(`품목 ${i+1}`, `${v(`lines.${i}.item`)??"?"} × ${v(`lines.${i}.qty`)??"?"} ${v(`lines.${i}.unit`)??""}`, `lines.${i}.qty`, v(`lines.${i}.qty`))).join("")}
-        ${readOnly?"":row("팔레트", `${f["pallets.confirmed"]?f["pallets.confirmed"].value+"개 확정":"미확정"} (송장 ${v("pallets.invoice")??"-"} / 메시지 ${v("pallets.message")??"-"})`, "pallets.confirmed", f["pallets.confirmed"]?.value)}
+        ${(readOnly||f["supplier"]?.value)?"":row("팔레트", `${f["pallets.confirmed"]?f["pallets.confirmed"].value+"개 확정":"미확정"} (송장 ${v("pallets.invoice")??"-"} / 메시지 ${v("pallets.message")??"-"})`, "pallets.confirmed", f["pallets.confirmed"]?.value)}
         ${row("차량 / 기사", [v("vehicle_no"),v("driver_phone")].filter(Boolean).join(" / ")||"-")}
         ${f["transport.carrier"]?row("운반", `${v("transport.carrier")??"?"} · ${won(v("transport.fee"))}`, "transport.fee", v("transport.fee")):""}
         ${d.claims.filter(c=>c.state==="active").map(c=>row(c.kind==="receivable"?"받을 돈":"줄 돈", `${esc(c.party_name)} ${won(c.amount)}`)).join("")}
@@ -229,6 +265,16 @@ function renderCheck(c){
       body = `<div class="row"><button onclick="ans(${id},{choice:'invoice'})">송장 ${d.invoice}개</button><button onclick="ans(${id},{choice:'message'})">상차 메시지 ${d.message}개</button>${inp("", "실제 수량", "number")}<button onclick="ansVal(${id})">입력</button><span class="meta">나중에 해도 제품 출하 반영은 유지됩니다</span></div>`; break;
     case "pallet_missing":
       body = `<div class="row">${inp(d.invoice??d.message, "확정 수량", "number")}<button onclick="ansVal(${id})">확정</button><span class="meta">자료가 오면 확정하세요. 그때까지 팔레트 확인 미결</span></div>`; break;
+    case "doc_kind": {
+      const sug = d.suggestion ? d.suggestion.answer : null;
+      const why = d.suggestion ? `지난 답: ${d.choices.find(x=>x.choice===sug)?.label} (${d.suggestion.count}/${d.suggestion.total}건)${d.suggestion.conflict?" · 답이 엇갈렸음":""}`
+                : (d.hint ? `참고: ${d.choices.find(x=>x.choice===d.hint.answer)?.label} 같음 — ${d.hint.why}` : "");
+      body = `<div class="src">${esc(d.decision_label)}</div>${why?`<div class="src">${esc(why)}</div>`:""}
+        <div class="row">${d.choices.map(x=>`<button class="${x.choice===sug?"primary":""}" onclick="ans(${id},{choice:'${x.choice}'})">${esc(x.label)}</button>`).join("")}</div>`; break; }
+    case "item_map": {
+      const sug = d.suggestion ? d.suggestion.answer.choice : null;
+      body = `${d.suggestion?`<div class="src">지난 답: ${esc(d.suggestion.answer.label)} (${d.suggestion.count}/${d.suggestion.total}건)</div>`:""}
+        <div class="row">${d.candidates.map(x=>`<button class="${x.choice===sug?"primary":""}" onclick="ans(${id},{choice:'${x.choice}'})">${esc(x.label)}</button>`).join("")}</div>`; break; }
     case "identity":
       body = `<div class="src">기존: ${esc(d.other_title)}</div>${(d.diffs||[]).length&&d.mode==="revision_candidate"?`<div class="src">${d.diffs.map(x=>`${esc(x.label)}: ${esc(x.old)} → ${esc(x.new)}`).join(" · ")}</div>`:""}
         <div class="row"><button class="primary" onclick="ans(${id},{choice:'same'})">${d.mode==="revision_candidate"?"같은 출하 — 차이만 반영":"같은 출하 — 반영 안 함"}</button><button onclick="ans(${id},{choice:'separate'})">별개 출하</button></div>`; break;

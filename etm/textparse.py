@@ -53,15 +53,20 @@ DOCNO_RE = re.compile(r"(?<!\d)(20\d{6}-\d{1,3})(?!\d)")
 LINE_RE = re.compile(r"^(?P<name>.*?\S)(?:\s+|\s*[x×*]\s*)(?P<qty>\d[\d,]*(?:\.\d+)?)\s*(?P<unit>[A-Za-z가-힣㎡]{0,4}\d?)\s*$")
 
 
-def to_payload(text: str, known_customers: list[str] | None = None) -> tuple[dict, list[str]]:
-    """텍스트 → (입력 계약 payload, 변환 메모). 변환할 내용이 없으면 ValueError."""
+def to_payload(text: str, known_customers: list[str] | None = None,
+               doc_type: str | None = None) -> tuple[dict, list[str]]:
+    """텍스트 → (입력 계약 payload, 변환 메모). 변환할 내용이 없으면 ValueError.
+
+    doc_type 을 주지 않으면 문서 종류를 **판단하지 않는다**. payload["doc_type"] 은 None 으로 두고,
+    참고용 추정(doc_type_guess)과 양식 키(form_key)만 붙인다. 종류는 사용자 확인 또는 승인된 규칙이 정한다.
+    doc_type 을 주면 그 종류의 항목 해석으로 다시 변환한다."""
     text = (text or "").strip()
     if not text:
         raise ValueError("입력 내용이 비어 있습니다")
     loose = _loose_json(text)
     if loose is not None:
         return loose, ["JSON 형식 오류를 자동으로 고쳤습니다"]
-    return _from_text(text, known_customers or [])
+    return _from_text(text, known_customers or [], doc_type)
 
 
 # --------------------------------------------------------------------------- 1) 느슨한 JSON
@@ -82,9 +87,13 @@ def _loose_json(text: str) -> dict | None:
 
 
 # --------------------------------------------------------------------------- 2) 항목: 값 텍스트
-def _from_text(text: str, known_customers: list[str]) -> tuple[dict, list[str]]:
-    doc_type = _doc_type(text)
-    p: dict = {"channel": "manual", "doc_type": doc_type, "raw_text": text}
+def _from_text(text: str, known_customers: list[str], decided: str | None) -> tuple[dict, list[str]]:
+    guess = _doc_type(text)
+    doc_type = decided or guess          # 항목 해석에만 쓴다. 결정은 아님
+    p: dict = {"channel": "manual", "doc_type": decided, "raw_text": text}
+    if not decided:
+        p["doc_type_guess"] = guess
+    labels: list[str] = []
     meta: dict[str, dict] = {}
     notes: list[str] = []
     lines: list[dict] = []
@@ -117,6 +126,7 @@ def _from_text(text: str, known_customers: list[str]) -> tuple[dict, list[str]]:
                 unknown.append(line)
                 continue
         key, val = m["k"].strip(), m["v"].strip()
+        labels.append(re.sub(r"[\s\d]", "", key))
         # 괄호 안이 메모(손글씨·확인 요구 등)일 때만 떼어낸다. '(가상)', '(주)' 같은 이름 일부는 유지
         note_parts = [x for x in re.findall(r"\(([^)]*)\)", val) if _is_note(x)]
         note = " ".join(note_parts)
@@ -214,6 +224,8 @@ def _from_text(text: str, known_customers: list[str]) -> tuple[dict, list[str]]:
     if meta:
         p["meta"] = meta
     p["input_id"] = "text-" + hashlib.sha256(text.encode()).hexdigest()[:12]
+    # 양식 키: 어떤 항목들로 이루어진 자료인지. 같은 양식이면 같은 판단을 재사용할 수 있다.
+    p["form_key"] = "·".join(sorted(set(labels)))
     return p, notes
 
 
@@ -229,7 +241,7 @@ def _doc_type(text: str) -> str:
     if "입고" in keys or "입고전표" in text:
         return "receipt"
     if "거래명세서" in text:
-        return "statement"
+        return "other"
     return "shipment_invoice"
 
 

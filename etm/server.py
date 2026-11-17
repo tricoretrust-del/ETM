@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import contract, db, process, seed, textparse
+from . import contract, db, learn, process, seed, textparse
 
 STATIC = Path(__file__).parent / "static"
 
@@ -30,6 +30,16 @@ class App:
                 return 200, seed.examples()
             if method == "GET" and path == "/api/items":
                 return 200, [dict(r) for r in c.execute("SELECT id, code, name, unit FROM item WHERE kind='product'")]
+            if method == "GET" and path == "/api/rules":
+                return 200, learn.overview(c)
+            if method == "POST" and path == "/api/rules/approve":
+                with process.Tx(c):
+                    rid = learn.approve(c, int((body or {}).get("curriculum_id", 0)))
+                return 200, {"rule_id": rid, **learn.overview(c)}
+            if method == "POST" and path == "/api/rules/suspend":
+                with process.Tx(c):
+                    learn.suspend(c, str((body or {}).get("rule_id", "")))
+                return 200, learn.overview(c)
             m = re.fullmatch(r"/api/events/(\d+)", path)
             if method == "GET" and m:
                 return 200, process.event_detail(c, int(m[1]))
@@ -38,10 +48,7 @@ class App:
                 notes: list[str] = []
                 if "text" in body and "input_id" not in body:
                     # JSON 이 아닌 입력: 입력 계약 형식으로 자동 변환 후 접수
-                    names = []
-                    for r in c.execute("SELECT name, aliases FROM party WHERE kind='customer'"):
-                        names += [r["name"], *json.loads(r["aliases"] or "[]")]
-                    body, notes = textparse.to_payload(body["text"], names)
+                    body, notes = textparse.to_payload(body["text"], process.customer_names(c))
                 res = process.intake(c, body)
                 res["converted"] = bool(notes) or "raw_text" in body
                 res["notes"] = notes

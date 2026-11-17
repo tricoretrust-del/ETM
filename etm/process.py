@@ -33,6 +33,7 @@ OBLIGATION_LABEL = {
     "freight_info": "운반 내역 확인",
     "freight_pay": "운반비 지급",
     "pallet_return": "팔레트 회수",
+    "stock_in": "입고 반영",
 }
 
 
@@ -334,7 +335,11 @@ def sync_checks(conn, ev, fields) -> list[dict]:
     """필요한 확인 목록과 저장된 확인 요청을 맞춘다. 이미 답한 같은 질문은 다시 묻지 않는다."""
     identity_open = conn.execute(
         "SELECT 1 FROM check_item WHERE event_id=? AND kind='identity' AND state='open'", (ev["id"],)).fetchone()
-    needed = [] if identity_open else required_checks(conn, ev, fields)
+    if ev["kind"] == "receipt":
+        from . import receipt
+        needed = receipt.required_checks(conn, ev, fields)
+    else:
+        needed = [] if identity_open else required_checks(conn, ev, fields)
     existing = conn.execute("SELECT * FROM check_item WHERE event_id=? AND kind<>'identity'",
                             (ev["id"],)).fetchall()
     by_key = {(r["path"], r["kind"], r["signature"]): r for r in existing}
@@ -367,6 +372,9 @@ def sync_checks(conn, ev, fields) -> list[dict]:
 def reconcile(conn, event_id) -> dict:
     """목표 상태와 기록된 효과의 차이만 기록한다(멱등)."""
     ev, fields = load_event(conn, event_id)
+    if ev["kind"] == "receipt":
+        from . import receipt
+        return receipt.reconcile(conn, event_id)
     blocked = _blocked_paths(conn, event_id)
     identity_open = conn.execute(
         "SELECT 1 FROM check_item WHERE event_id=? AND kind='identity' AND state='open'", (event_id,)).fetchone()
@@ -565,10 +573,11 @@ def describe_changes(conn, changes) -> str:
     bits = []
     for m in changes["moves"]:
         name, unit = item_name(conn, m["item_id"])
+        into_factory = m["to"] == "factory"
         if m["owner"] == "own":
-            bits.append(f"재고 {name} {-m['delta']:+g}{unit}")
+            bits.append(f"재고 {name} {(m['delta'] if into_factory else -m['delta']):+g}{unit}")
         else:
-            bits.append(f"팔레트 {m['delta']:+g} → 현장")
+            bits.append(f"{name} {m['delta']:+g} → {'공장' if into_factory else '현장'}")
     for m in changes["money"]:
         label = "받을 돈" if m["kind"] == "receivable" else "줄 돈(운반비)"
         if m["state"] == "void":
@@ -589,85 +598,184 @@ def remaining(conn, event_id) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- public operations
+def customer_names(conn) -> list[str]:
+    names = []
+    for r in conn.execute("SELECT name, aliases FROM party WHERE kind='customer'"):
+        names += [r["name"], *_aliases(r)]
+    return names
+
+
 def intake(conn, payload: dict) -> dict:
-    """새 자료 접수. 반환: {event_id, outcome, checks, summary}"""
-    header, fields = contract.normalize(payload)
-    h = contract.payload_hash(payload)
+    """새 자료 접수. 반환: {event_id, outcome, checks}"""
+    if not payload.get("doc_type") and payload.get("raw_text"):
+        contract.normalize({**payload, "doc_type": payload.get("doc_type_guess")})  # 형식 오류는 먼저 알린다
+    else:
+        contract.normalize(payload)
     with Tx(conn):
-        # (a) 같은 내용 재수신 → 기존 사건에 증빙만 연결, 추가 반영 없음
-        same = conn.execute(
-            "SELECT i.event_id FROM intake i JOIN event e ON e.id=i.event_id"
-            " WHERE i.payload_hash=? AND e.status IN ('active','held') ORDER BY i.id LIMIT 1", (h,)).fetchone()
-        if same:
-            ev_id = same["event_id"]
-            conn.execute("INSERT INTO intake(input_id, channel, source_ref, received_at, payload, payload_hash, event_id, outcome)"
-                         " VALUES (?,?,?,?,?,?,?,'re_receive')",
-                         (header["input_id"], header["channel"], header["source_ref"], now(), jdump(payload), h, ev_id))
-            log(conn, ev_id, "re_receive", f"재수신 — 이미 기록된 {event_title(conn, ev_id)} · 추가 반영 없음")
-            return {"event_id": ev_id, "outcome": "re_receive", "checks": _checks_out(conn, ev_id)}
+        return _intake_tx(conn, payload)
 
-        if header["doc_type"] not in contract.PROCESSED_DOC_TYPES:
-            # 아직 처리 규칙이 없는 문서: 거부하지 않고 원본·변환값만 보관한다. 재고·돈 반영 없음.
-            t = now()
-            ev_id = conn.execute(
-                "INSERT INTO event(kind, doc_type, doc_no, trade_date, created_at, updated_at, status, fields)"
-                " VALUES (?, ?, ?, ?, ?, ?, 'held', ?)",
-                (header["doc_type"], header["doc_type"], fields["doc_no"]["value"], fields["trade_date"]["value"],
-                 t, t, jdump(fields))).lastrowid
-            conn.execute("INSERT INTO intake(input_id, channel, source_ref, received_at, payload, payload_hash, event_id, outcome)"
-                         " VALUES (?,?,?,?,?,?,?,'held')",
-                         (header["input_id"], header["channel"], header["source_ref"], t, jdump(payload), h, ev_id))
-            log(conn, ev_id, "hold", f"{event_title(conn, ev_id)} · 보관만 함(처리 기능 준비 중, 재고·돈 반영 없음)")
-            return {"event_id": ev_id, "outcome": "held", "checks": []}
 
-        if header.get("price_ref"):
-            fields["_price_ref"] = header["price_ref"]
-        t = now()
-        cur = conn.execute(
-            "INSERT INTO event(kind, doc_type, doc_no, trade_date, created_at, updated_at, status, fields)"
-            " VALUES ('shipment', ?, ?, ?, ?, ?, 'active', ?)",
-            (header["doc_type"], fields["doc_no"]["value"], fields["trade_date"]["value"], t, t, jdump(fields)))
-        ev_id = cur.lastrowid
+def _rebuild(conn, payload: dict, kind: str) -> dict:
+    """종류가 정해진 뒤, 그 종류의 항목 해석으로 원문을 다시 변환한다."""
+    from . import textparse
+    new, _ = textparse.to_payload(payload["raw_text"], customer_names(conn), doc_type=kind)
+    for k in ("input_id", "channel", "source_ref"):
+        if payload.get(k) is not None:
+            new[k] = payload[k]
+    return new
 
-        # (b) 같은 전표번호의 다른 내용 → 기존 사건 수정 후보
-        # (c) 다른 번호지만 거래처·날짜·품목·수량이 같은 사건 → 업무상 중복 후보
-        outcome, dup = "new", None
-        doc_no = fields["doc_no"]["value"]
-        cust_n = norm(fields["customer"]["value"])
-        for r in conn.execute("SELECT * FROM event WHERE status='active' AND id<>? AND doc_type=?",
-                              (ev_id, header["doc_type"])).fetchall():
-            rf = json.loads(r["fields"])
-            r_cust = norm(rf["customer"]["value"])
-            if doc_no and r["doc_no"] == doc_no and (not cust_n or not r_cust or cust_n == r_cust):
-                outcome, dup = "revision_candidate", r
-                break
-            if (cust_n and cust_n == r_cust and fields["trade_date"]["value"]
-                    and fields["trade_date"]["value"] == r["trade_date"] and _line_sig(conn, fields) == _line_sig(conn, rf)
-                    and line_indexes(fields)):
-                outcome, dup = "duplicate_candidate", r
-        if dup is not None:
-            diffs = _diff_fields(json.loads(dup["fields"]), fields)
-            msg = (f"같은 전표번호({doc_no})의 기존 기록이 있습니다. 내용이 다릅니다: "
-                   + ", ".join(d["label"] for d in diffs) if outcome == "revision_candidate"
-                   else f"거래처·날짜·품목·수량이 같은 기존 기록(전표 {dup['doc_no'] or '없음'})이 있습니다. 같은 출하입니까?")
-            conn.execute(
-                "INSERT INTO check_item(event_id, path, kind, signature, rule_id, message, detail, state, created_at)"
-                " VALUES (?, '_identity', 'identity', ?, NULL, ?, ?, 'open', ?)",
-                (ev_id, jdump({"other": dup["id"]}), msg,
-                 jdump({"other_event": dup["id"], "other_title": event_title(conn, dup["id"]), "mode": outcome,
-                        "diffs": diffs}), now()))
 
+def _intake_tx(conn, payload: dict, decided_by: str | None = None) -> dict:
+    from . import learn
+    h = contract.payload_hash(payload)
+    # (a) 같은 내용 재수신 → 기존 사건에 증빙만 연결, 추가 반영 없음
+    same = conn.execute(
+        "SELECT COALESCE(e.merged_into, e.id) event_id FROM intake i JOIN event e ON e.id=i.event_id"
+        " WHERE i.payload_hash=? AND e.status IN ('active','held','pending','merged') ORDER BY i.id LIMIT 1",
+        (h,)).fetchone()
+    if same:
+        ev_id = same["event_id"]
+        header = {"input_id": payload.get("input_id"), "channel": payload.get("channel"),
+                  "source_ref": payload.get("source_ref")}
         conn.execute("INSERT INTO intake(input_id, channel, source_ref, received_at, payload, payload_hash, event_id, outcome)"
-                     " VALUES (?,?,?,?,?,?,?,?)",
-                     (header["input_id"], header["channel"], header["source_ref"], now(), jdump(payload), h, ev_id, outcome))
-        ev, fields = load_event(conn, ev_id)
-        sync_checks(conn, ev, fields)
-        save_fields(conn, ev_id, fields)
-        changes = reconcile(conn, ev_id)
-        eff = describe_changes(conn, changes)
-        log(conn, ev_id, "intake", f"{'스캔' if header['channel'] == 'scan' else '직접입력'} 접수 · {event_title(conn, ev_id)}"
-            + (f" · {eff}" if eff else ""), {"changes": changes, "input_id": header["input_id"]})
-        return {"event_id": ev_id, "outcome": outcome, "checks": _checks_out(conn, ev_id)}
+                     " VALUES (?,?,?,?,?,?,?,'re_receive')",
+                     (header["input_id"], header["channel"], header["source_ref"], now(), jdump(payload), h, ev_id))
+        log(conn, ev_id, "re_receive", f"재수신 — 이미 기록된 {event_title(conn, ev_id)} · 추가 반영 없음")
+        return {"event_id": ev_id, "outcome": "re_receive", "checks": _checks_out(conn, ev_id)}
+
+    # (b) 자료 종류(=가치 이동 방향)가 정해지지 않은 텍스트: 규칙이 있으면 규칙대로, 없으면 사용자에게 묻는다
+    if not payload.get("doc_type") and payload.get("raw_text"):
+        key = payload.get("form_key") or ""
+        label = f"항목 구성이 [{key or '없음'}]인 자료"
+        rule = learn.find_rule(conn, "doc_kind", key)
+        if rule:
+            res = _intake_tx(conn, _rebuild(conn, payload, learn.rule_answer(rule)), decided_by=rule["id"])
+            learn.record_case(conn, event_id=res["event_id"], check_id=None, kind="doc_kind", key=key, label=label,
+                              answer=learn.rule_answer(rule), rule_id=rule["id"])
+            return res
+        return _pending_kind(conn, payload, h, key, label)
+
+    header, fields = contract.normalize(payload)
+    by_rule = f" · 규칙 {decided_by}로 종류 판정" if decided_by else ""
+    t = now()
+
+    if header["doc_type"] not in contract.PROCESSED_DOC_TYPES:
+        # 재고와 무관한 자료: 원본·변환값만 보관한다. 재고·돈 반영 없음.
+        ev_id = conn.execute(
+            "INSERT INTO event(kind, doc_type, doc_no, trade_date, created_at, updated_at, status, fields)"
+            " VALUES (?, ?, ?, ?, ?, ?, 'held', ?)",
+            (header["doc_type"], header["doc_type"], fields["doc_no"]["value"], fields["trade_date"]["value"],
+             t, t, jdump(fields))).lastrowid
+        _insert_intake(conn, header, payload, h, ev_id, "held")
+        log(conn, ev_id, "hold", f"{event_title(conn, ev_id)} · 보관만 함(재고·돈 반영 없음){by_rule}")
+        return {"event_id": ev_id, "outcome": "held", "checks": []}
+
+    if header["doc_type"] == "receipt":
+        ev_id = conn.execute(
+            "INSERT INTO event(kind, doc_type, doc_no, trade_date, created_at, updated_at, status, fields)"
+            " VALUES ('receipt', 'receipt', ?, ?, ?, ?, 'active', ?)",
+            (fields["doc_no"]["value"], fields["trade_date"]["value"], t, t, jdump(fields))).lastrowid
+        _insert_intake(conn, header, payload, h, ev_id, "new")
+        return _finish_intake(conn, ev_id, header, "new", by_rule)
+
+    if header.get("price_ref"):
+        fields["_price_ref"] = header["price_ref"]
+    ev_id = conn.execute(
+        "INSERT INTO event(kind, doc_type, doc_no, trade_date, created_at, updated_at, status, fields)"
+        " VALUES ('shipment', ?, ?, ?, ?, ?, 'active', ?)",
+        (header["doc_type"], fields["doc_no"]["value"], fields["trade_date"]["value"], t, t, jdump(fields))).lastrowid
+
+    # 같은 전표번호의 다른 내용 → 기존 사건 수정 후보
+    # 다른 번호지만 거래처·날짜·품목·수량이 같은 사건 → 업무상 중복 후보
+    outcome, dup = "new", None
+    doc_no = fields["doc_no"]["value"]
+    cust_n = norm(fields["customer"]["value"])
+    for r in conn.execute("SELECT * FROM event WHERE status='active' AND kind='shipment' AND id<>? AND doc_type=?",
+                          (ev_id, header["doc_type"])).fetchall():
+        rf = json.loads(r["fields"])
+        r_cust = norm(rf["customer"]["value"])
+        if doc_no and r["doc_no"] == doc_no and (not cust_n or not r_cust or cust_n == r_cust):
+            outcome, dup = "revision_candidate", r
+            break
+        if (cust_n and cust_n == r_cust and fields["trade_date"]["value"]
+                and fields["trade_date"]["value"] == r["trade_date"] and _line_sig(conn, fields) == _line_sig(conn, rf)
+                and line_indexes(fields)):
+            outcome, dup = "duplicate_candidate", r
+    if dup is not None:
+        diffs = _diff_fields(json.loads(dup["fields"]), fields)
+        msg = (f"같은 전표번호({doc_no})의 기존 기록이 있습니다. 내용이 다릅니다: "
+               + ", ".join(d["label"] for d in diffs) if outcome == "revision_candidate"
+               else f"거래처·날짜·품목·수량이 같은 기존 기록(전표 {dup['doc_no'] or '없음'})이 있습니다. 같은 출하입니까?")
+        conn.execute(
+            "INSERT INTO check_item(event_id, path, kind, signature, rule_id, message, detail, state, created_at)"
+            " VALUES (?, '_identity', 'identity', ?, NULL, ?, ?, 'open', ?)",
+            (ev_id, jdump({"other": dup["id"]}), msg,
+             jdump({"other_event": dup["id"], "other_title": event_title(conn, dup["id"]), "mode": outcome,
+                    "diffs": diffs}), now()))
+    _insert_intake(conn, header, payload, h, ev_id, outcome)
+    return _finish_intake(conn, ev_id, header, outcome, by_rule)
+
+
+def _insert_intake(conn, header, payload, h, ev_id, outcome):
+    conn.execute("INSERT INTO intake(input_id, channel, source_ref, received_at, payload, payload_hash, event_id, outcome)"
+                 " VALUES (?,?,?,?,?,?,?,?)",
+                 (header["input_id"], header["channel"], header["source_ref"], now(), jdump(payload), h, ev_id, outcome))
+
+
+def _finish_intake(conn, ev_id, header, outcome, by_rule=""):
+    ev, fields = load_event(conn, ev_id)
+    sync_checks(conn, ev, fields)
+    save_fields(conn, ev_id, fields)
+    changes = reconcile(conn, ev_id)
+    eff = describe_changes(conn, changes)
+    _, fields = load_event(conn, ev_id)
+    learned = sorted({f["ref_source"][5:] for f in fields.values()
+                      if isinstance(f, dict) and str(f.get("ref_source", "")).startswith("rule:L-")})
+    if learned:
+        by_rule += f" · 규칙 {', '.join(learned)}로 품목 연결"
+    log(conn, ev_id, "intake", f"{'스캔' if header['channel'] == 'scan' else '직접입력'} 접수 · {event_title(conn, ev_id)}"
+        + (f" · {eff}" if eff else "") + by_rule, {"changes": changes, "input_id": header["input_id"]})
+    return {"event_id": ev_id, "outcome": outcome, "checks": _checks_out(conn, ev_id)}
+
+
+def _pending_kind(conn, payload, h, key, label):
+    """자료 종류를 사용자에게 묻는다. 미리보기용 해석은 저장하지만 아무것도 반영하지 않는다."""
+    from . import learn
+    guess = payload.get("doc_type_guess") or "shipment_invoice"
+    header, fields = contract.normalize({**payload, "doc_type": guess})
+    t = now()
+    ev_id = conn.execute(
+        "INSERT INTO event(kind, doc_type, doc_no, trade_date, created_at, updated_at, status, fields)"
+        " VALUES ('pending', 'unknown', ?, ?, ?, ?, 'pending', ?)",
+        (fields["doc_no"]["value"], fields["trade_date"]["value"], t, t, jdump(fields))).lastrowid
+    _insert_intake(conn, header, payload, h, ev_id, "pending")
+    sug = learn.suggestion(conn, "doc_kind", key)
+    detail = {"decision_key": key, "decision_label": label,
+              "choices": [{"choice": k, "label": v} for k, v in contract.DOC_KIND_CHOICES.items()],
+              "suggestion": sug,
+              "hint": None if sug else {"answer": guess, "why": _guess_reason(payload)}}
+    conn.execute(
+        "INSERT INTO check_item(event_id, path, kind, signature, rule_id, message, detail, state, created_at)"
+        " VALUES (?, '_doc_kind', 'doc_kind', ?, NULL, ?, ?, 'open', ?)",
+        (ev_id, jdump({"k": key}), "이 자료는 어떤 이동입니까?", jdump(detail), t))
+    log(conn, ev_id, "intake", f"접수 · 자료 종류 확인 대기 · {_preview(fields)}")
+    return {"event_id": ev_id, "outcome": "pending", "checks": _checks_out(conn, ev_id)}
+
+
+def _guess_reason(payload) -> str:
+    g = payload.get("doc_type_guess")
+    if g == "receipt":
+        return "'입고' 항목이 있음"
+    if g == "other":
+        return "'거래명세서' 표기가 있음"
+    return "입고 표시가 없음"
+
+
+def _preview(fields) -> str:
+    who = [(fields.get(p) or {}).get("value") for p in ("supplier", "customer", "receiver")]
+    items = [f"{fields[f'lines.{i}.item']['value'] or '품목?'} {_fmt_qty(fields[f'lines.{i}.qty']['value'])}"
+             for i in line_indexes(fields)]
+    return " · ".join(x for x in [" / ".join(w for w in who if w), ", ".join(items)] if x) or "내용 미확인"
 
 
 def _line_sig(conn, fields):
@@ -706,6 +814,8 @@ def answer(conn, event_id: int, answers: dict[str, dict]) -> dict:
                                (int(cid), event_id)).fetchone()
             if not chk:
                 continue
+            if chk["kind"] == "doc_kind":
+                return _answer_doc_kind(conn, ev, chk, ans or {})
             before = (fields.get(chk["path"]) or {}).get("value")
             result = _apply_answer(conn, ev, fields, chk, ans or {})
             if result == "merged":
@@ -734,6 +844,24 @@ def answer(conn, event_id: int, answers: dict[str, dict]) -> dict:
         return {"event_id": event_id, "checks": _checks_out(conn, event_id)}
 
 
+def _answer_doc_kind(conn, ev, chk, ans):
+    """자료 종류 확정 → 사례 기록 → 그 종류의 해석으로 다시 접수(같은 트랜잭션)."""
+    from . import learn
+    kind = ans.get("choice")
+    if kind not in contract.DOC_KIND_CHOICES:
+        raise ValueError("자료 종류를 선택하세요")
+    detail = json.loads(chk["detail"])
+    conn.execute("UPDATE check_item SET state='answered', answer=?, answered_at=? WHERE id=?", (jdump(ans), now(), chk["id"]))
+    payload = json.loads(conn.execute("SELECT payload FROM intake WHERE event_id=? ORDER BY id LIMIT 1",
+                                      (ev["id"],)).fetchone()[0])
+    res = _intake_tx(conn, _rebuild(conn, payload, kind))
+    conn.execute("UPDATE event SET status='merged', merged_into=?, updated_at=? WHERE id=?", (res["event_id"], now(), ev["id"]))
+    learn.record_case(conn, event_id=res["event_id"], check_id=chk["id"], kind="doc_kind", key=detail["decision_key"],
+                      label=detail["decision_label"], answer=kind)
+    log(conn, ev["id"], "confirm", f"자료 종류: {contract.DOC_KIND_CHOICES[kind]}")
+    return {"event_id": res["event_id"], "checks": res["checks"]}
+
+
 def _apply_answer(conn, ev, fields, chk, ans):
     kind, path = chk["kind"], chk["path"]
     detail = json.loads(chk["detail"])
@@ -743,6 +871,13 @@ def _apply_answer(conn, ev, fields, chk, ans):
         fld = fields.setdefault(p, {"value": None, "orig": None, "raw": None, "flags": [], "source": "user"})
         fld["value"] = v
         fld["source"] = "user"
+
+    if kind == "item_map":
+        from . import learn, receipt
+        decision = receipt.apply_item_answer(conn, fields, chk, ans)
+        learn.record_case(conn, event_id=ev["id"], check_id=chk["id"], kind="item_map", key=detail["decision_key"],
+                          label=detail["decision_label"], answer=decision)
+        return None
 
     if kind == "identity":
         if choice == "same":
@@ -974,7 +1109,11 @@ def summary(conn) -> dict:
     pallets = [dict(r) for r in conn.execute(
         "SELECT m.to_loc loc, COALESCE(s.address, p.name, m.to_loc) place, SUM(m.qty) qty FROM value_move m"
         " LEFT JOIN site s ON m.to_loc = 'site:' || s.id LEFT JOIN party p ON m.to_loc = 'party:' || p.id"
-        " WHERE m.owner LIKE 'party:%' GROUP BY m.to_loc HAVING SUM(m.qty) <> 0")]
+        " WHERE m.owner LIKE 'party:%' AND m.to_loc <> 'factory' GROUP BY m.to_loc HAVING SUM(m.qty) <> 0")]
+    rental_factory = [dict(r) for r in conn.execute(
+        "SELECT i.name, i.unit, SUM(CASE WHEN m.to_loc='factory' THEN m.qty ELSE 0 END)"
+        " - SUM(CASE WHEN m.from_loc='factory' THEN m.qty ELSE 0 END) qty FROM value_move m JOIN item i ON i.id=m.item_id"
+        " WHERE m.owner LIKE 'party:%' GROUP BY i.id HAVING qty <> 0")]
     claims = [dict(r) for r in conn.execute(
         "SELECT c.kind, c.role, c.party_name, c.amount, c.settled, c.event_id FROM money_claim c"
         " JOIN event e ON e.id=c.event_id WHERE c.state='active' AND e.status='active'"
@@ -985,5 +1124,5 @@ def summary(conn) -> dict:
         unknown = sum(1 for c in claims if c["kind"] == kind and c["amount"] is None)
         return {"known": known, "undetermined_count": unknown}
 
-    return {"stock": stock, "pallets_out": pallets, "receivable": tot("receivable"), "payable": tot("payable"),
+    return {"stock": stock, "pallets_out": pallets, "rental_factory": rental_factory, "receivable": tot("receivable"), "payable": tot("payable"),
             "claims": claims}

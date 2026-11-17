@@ -11,10 +11,13 @@ import re
 from datetime import date
 
 DOC_TYPES = {"shipment_invoice": "shipment_invoice", "출하송장": "shipment_invoice", "송장": "shipment_invoice",
-             "receipt": "receipt", "입고전표": "receipt", "statement": "statement", "거래명세서": "statement"}
-# 현재 처리(재고·돈 반영)는 출하 송장만. 나머지는 원본·변환값을 보관만 한다.
-PROCESSED_DOC_TYPES = {"shipment_invoice"}
-DOC_LABEL = {"shipment_invoice": "출하송장", "receipt": "입고전표", "statement": "거래명세서"}
+             "receipt": "receipt", "입고전표": "receipt", "other": "other", "statement": "other", "거래명세서": "other"}
+# 재고 반영을 하는 종류. other 는 원본·변환값을 보관만 한다.
+PROCESSED_DOC_TYPES = {"shipment_invoice", "receipt"}
+DOC_LABEL = {"shipment_invoice": "출하송장", "receipt": "입고", "other": "기타 자료", "unknown": "종류 확인 대기"}
+# 사용자에게 묻는 자료 종류(=가치 이동 방향)
+DOC_KIND_CHOICES = {"shipment_invoice": "출하 (공장 → 거래처)", "receipt": "입고 (→ 공장)",
+                    "other": "재고와 무관 (보관만)"}
 CHANNELS = {"scan", "manual"}
 
 # 숫자로 계산하지 않고 문자열로만 다루는 필드
@@ -89,7 +92,7 @@ def normalize(payload: dict) -> tuple[dict, dict]:
         errors.append("channel: scan 또는 manual")
     doc_type = DOC_TYPES.get(payload.get("doc_type") or "shipment_invoice")
     if not doc_type:
-        errors.append("doc_type: shipment_invoice(출하송장) | receipt(입고전표) | statement(거래명세서)")
+        errors.append("doc_type: shipment_invoice(출하) | receipt(입고) | other(보관만)")
 
     trade_date = payload.get("trade_date")
     if trade_date is not None:

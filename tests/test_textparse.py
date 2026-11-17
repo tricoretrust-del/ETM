@@ -30,21 +30,26 @@ RECEIPT_TEXT = """1. 업체명: (사진에 안나옴, 다음부터는 제대로 
 
 
 class TestTextParse(unittest.TestCase):
-    def test_receipt_is_held_not_shipped(self):
+    def test_receipt_kind_is_not_decided_by_program(self):
         p, _ = textparse.to_payload(RECEIPT_TEXT)
-        self.assertEqual(p["doc_type"], "receipt")
-        self.assertEqual(p["supplier"], "LOGISALL")            # 업체명 = 보낸 업체
-        self.assertEqual(p["receiver"], "주식회사 지오블록")      # 납품처 = 받은 곳 (거래처 아님)
-        self.assertNotIn("customer", p)
-        self.assertEqual(p["trade_date"], "2026-11-11")
-        self.assertEqual(p["driver_phone"], "010-7155-0855")
-        self.assertEqual(p["lines"], [{"item": "P10", "qty": 97, "unit": None}])
+        self.assertIsNone(p["doc_type"])                        # 프로그램이 종류를 정하지 않는다
+        self.assertEqual(p["doc_type_guess"], "receipt")        # 참고용 추정만
+        self.assertIn("입고일", p["form_key"])
+        # 사용자가 '입고'로 정하면 그 해석으로 다시 변환
+        q, _ = textparse.to_payload(RECEIPT_TEXT, doc_type="receipt")
+        self.assertEqual(q["supplier"], "LOGISALL")             # 업체명 = 보낸 업체
+        self.assertEqual(q["receiver"], "주식회사 지오블록")      # 납품처 = 받은 곳 (거래처 아님)
+        self.assertNotIn("customer", q)
+        self.assertEqual(q["trade_date"], "2026-11-11")
+        self.assertEqual(q["driver_phone"], "010-7155-0855")
+        self.assertEqual(q["lines"], [{"item": "P10", "qty": 97, "unit": None}])
         conn = db.connect(":memory:")
         seed.seed_demo(conn)
         before = process.summary(conn)
         r = process.intake(conn, p)
-        self.assertEqual(r["outcome"], "held")
-        self.assertEqual(process.summary(conn), before)          # 재고·돈 변화 없음
+        self.assertEqual(r["outcome"], "pending")
+        self.assertEqual([c["kind"] for c in r["checks"]], ["doc_kind"])
+        self.assertEqual(process.summary(conn), before)          # 묻는 동안 재고·돈 변화 없음
         self.assertEqual(process.intake(conn, p)["outcome"], "re_receive")
 
     def test_code_like_item_not_split(self):
@@ -82,6 +87,8 @@ class TestTextParse(unittest.TestCase):
         seed.seed_demo(conn)
         p, _ = textparse.to_payload(INVOICE_TEXT)
         r = process.intake(conn, p)
+        self.assertEqual([c["kind"] for c in r["checks"]], ["doc_kind"])   # 먼저 종류를 묻는다
+        r = process.answer(conn, r["event_id"], {str(r["checks"][0]["id"]): {"choice": "shipment_invoice"}})
         self.assertEqual({c["path"] for c in r["checks"]}, {"vehicle_no", "driver_phone"})
         p2, _ = textparse.to_payload(INVOICE_TEXT)
         self.assertEqual(process.intake(conn, p2)["outcome"], "re_receive")

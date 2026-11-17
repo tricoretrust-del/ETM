@@ -189,6 +189,33 @@ MIGRATIONS: list[str] = [
         state TEXT NOT NULL DEFAULT 'open'
     );
     """,
+    # ---- 0002: 학습 구조 (판단 위임 → 확정 사례 → 규칙 제안 → 승인된 규칙) ----
+    """
+    ALTER TABLE rulebook ADD COLUMN decision_kind TEXT;   -- 학습 규칙: 어떤 판단인가 (doc_kind, item_map …)
+    ALTER TABLE rulebook ADD COLUMN decision_key TEXT;    -- 어떤 상황에서 (양식 키, 업체|품목 …)
+    ALTER TABLE rulebook ADD COLUMN answer TEXT;          -- 무엇으로 정하는가 (JSON)
+    ALTER TABLE rulebook ADD COLUMN case_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE rulebook ADD COLUMN created_at TEXT;
+    ALTER TABLE curriculum ADD COLUMN decision_kind TEXT;
+    ALTER TABLE curriculum ADD COLUMN decision_key TEXT;
+    ALTER TABLE curriculum ADD COLUMN proposed_answer TEXT;
+    ALTER TABLE curriculum ADD COLUMN case_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE curriculum ADD COLUMN rule_id TEXT;
+    ALTER TABLE curriculum ADD COLUMN updated_at TEXT;
+    -- 사용자에게 위임한 판단 하나하나(또는 규칙이 대신 내린 판단)
+    CREATE TABLE decision_case (
+        id INTEGER PRIMARY KEY,
+        event_id INTEGER REFERENCES event(id),
+        check_id INTEGER REFERENCES check_item(id),
+        decision_kind TEXT NOT NULL,
+        decision_key TEXT NOT NULL,
+        label TEXT NOT NULL,          -- 사람이 읽는 상황 설명
+        answer TEXT NOT NULL,         -- JSON
+        rule_id TEXT,                 -- NULL = 사용자가 답함, 값 = 규칙이 처리함
+        at TEXT NOT NULL
+    );
+    CREATE INDEX decision_case_key ON decision_case(decision_kind, decision_key);
+    """,
 ]
 
 # 이번 구현에서 명시적으로 적용하는 고정 규칙(운영 룰북 초기값)
@@ -242,6 +269,11 @@ def migrate(conn: sqlite3.Connection) -> None:
             conn.executemany(
                 "INSERT INTO curriculum(title, evidence, next_check, done_criteria) VALUES (?,?,?,?)",
                 INITIAL_CURRICULUM)
+        if i == 2:
+            conn.execute(
+                "INSERT INTO rulebook(id, scope, condition, action, basis, version, status)"
+                " VALUES ('MASTER-EXACT','company:default','입력값이 기준정보(거래처·현장·품목)의 이름·코드·별칭과 정확히 같음',"
+                "'그 기준정보로 연결한다(묻지 않음)','v0.1 구현 기본값 — TRNK 검토 필요','v0.1','active')")
         conn.execute(f"PRAGMA user_version = {i}")
         conn.execute("COMMIT")
 
