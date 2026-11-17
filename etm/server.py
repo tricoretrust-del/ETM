@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import contract, db, learn, process, seed, textparse
+from . import contract, db, learn, plan, process, seed, textparse
 
 STATIC = Path(__file__).parent / "static"
 
@@ -41,6 +41,34 @@ class App:
             result = learn.idempotent(c, b.get("request_id"), cmd, fns[cmd])
         return {"result": result, **learn.overview(c)}
 
+    def plan_command(self, cmd: str, b: dict, actor: str):
+        c = self.conn
+        ev = b.get("expected_version")
+        fns = {
+            "create": lambda: {"plan_id": plan.create(
+                c, actor=actor, title=b.get("title", ""), purpose=b.get("purpose"), action=b.get("action"),
+                done_criteria=b.get("done_criteria"), assignee=b.get("assignee"), due_date=b.get("due_date"),
+                links=b.get("links") or [], execute_now=bool(b.get("execute_now")))},
+            "approve": lambda: plan.approve(c, plan_id=int(b["plan_id"]), actor=actor, expected_version=ev,
+                                            reason=b.get("reason") or ""),
+            "transition": lambda: plan.transition(c, plan_id=int(b["plan_id"]), actor=actor, to=b.get("to", ""),
+                                                  reason=b.get("reason") or "", expected_version=ev),
+            "complete": lambda: plan.complete(c, plan_id=int(b["plan_id"]), actor=actor, result=b.get("result") or "",
+                                              evidence=b.get("evidence") or [], expected_version=ev),
+            "reopen": lambda: plan.reopen(c, plan_id=int(b["plan_id"]), actor=actor, reason=b.get("reason") or "",
+                                          expected_version=ev),
+            "edit": lambda: plan.edit(c, plan_id=int(b["plan_id"]), actor=actor, changes=b.get("changes") or {},
+                                      expected_version=ev, reason=b.get("reason") or ""),
+            "link": lambda: {"link_id": plan.link(c, plan_id=int(b["plan_id"]), actor=actor, role=b.get("role", "basis"),
+                                                  kind=b.get("kind", ""), target_id=b.get("id"), note=b.get("note"))},
+            "unlink": lambda: plan.unlink(c, link_id=int(b["link_id"]), actor=actor, reason=b.get("reason") or "") or {},
+        }
+        if cmd not in fns:
+            raise KeyError("알 수 없는 명령")
+        with process.Tx(c):
+            result = learn.idempotent(c, b.get("request_id"), f"plan.{cmd}", fns[cmd])
+        return {"result": result, **learn.overview(c)}
+
     def handle(self, method: str, path: str, body: dict | None, actor: str = "owner"):
         process.ACTOR.set(actor)
         with self.lock:
@@ -58,6 +86,14 @@ class App:
             m = re.fullmatch(r"/api/learning/(\w+)", path)
             if method == "POST" and m:
                 return 200, self.learning_command(m[1], body or {}, actor)
+            if method == "GET" and path == "/api/plans":
+                return 200, {"plans": plan.list_plans(c)}
+            m = re.fullmatch(r"/api/plans/(\d+)", path)
+            if method == "GET" and m:
+                return 200, plan.detail(c, int(m[1]))
+            m = re.fullmatch(r"/api/plans/(\w+)", path)
+            if method == "POST" and m:
+                return 200, self.plan_command(m[1], body or {}, actor)
             m = re.fullmatch(r"/api/rule-versions/(\d+)/trace", path)
             if method == "GET" and m:
                 return 200, learn.trace_version(c, int(m[1]))

@@ -346,6 +346,96 @@ MIGRATIONS: list[str] = [
         at TEXT NOT NULL
     );
     """,
+    # ---- 0004: DEV-003 운영 PLN (실행계획) 복원·연결 ------------------------------
+    """
+    -- 운영 PLN: 무엇을 실행하고 무엇으로 완료를 판단할지
+    CREATE TABLE plan (
+        id INTEGER PRIMARY KEY,               -- 안정적인 ID (화면 표기 PLN-n)
+        company_id INTEGER NOT NULL REFERENCES company(id),
+        title TEXT NOT NULL,
+        purpose TEXT,                         -- 실행 목적 (미확정 허용)
+        action TEXT,                          -- 조치 내용
+        done_criteria TEXT,                   -- 완료 조건
+        status TEXT NOT NULL DEFAULT 'DRAFT'
+            CHECK (status IN ('DRAFT','READY','IN_PROGRESS','DONE','BLOCKED','DEFERRED','CANCELLED')),
+        status_reason TEXT,                   -- 차단·보류·취소·재개 사유
+        assignee TEXT REFERENCES app_user(id),
+        due_date TEXT,
+        approved_by TEXT REFERENCES app_user(id),   -- 실행 지시(READY 전환) 주체
+        approved_at TEXT,
+        result TEXT,                          -- 실행 결과
+        done_at TEXT,
+        origin TEXT,                          -- 이관 출처 등
+        created_by TEXT NOT NULL REFERENCES app_user(id),
+        created_at TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,   -- 수정 버전(동시 수정 검사)
+        updated_at TEXT NOT NULL,
+        CHECK (status IN ('DRAFT','CANCELLED') OR approved_by IS NOT NULL),
+        CHECK (status <> 'DONE' OR (result IS NOT NULL AND done_at IS NOT NULL AND done_criteria IS NOT NULL))
+    );
+    -- 계획 ↔ 근거·대상·완료 증빙 (복수, 대상은 정확히 하나, 끊을 때도 기록을 남김)
+    CREATE TABLE plan_link (
+        id INTEGER PRIMARY KEY,
+        plan_id INTEGER NOT NULL REFERENCES plan(id),
+        role TEXT NOT NULL CHECK (role IN ('basis','target','evidence')),
+        lag_id INTEGER REFERENCES lag(id),
+        event_id INTEGER REFERENCES event(id),
+        intake_id INTEGER REFERENCES intake(id),
+        rule_version_id INTEGER REFERENCES rule_version(id),
+        decision_case_id INTEGER REFERENCES decision_case(id),
+        obligation_id INTEGER REFERENCES obligation(id),
+        note TEXT,
+        created_by TEXT NOT NULL REFERENCES app_user(id),
+        created_at TEXT NOT NULL,
+        removed_by TEXT REFERENCES app_user(id),
+        removed_at TEXT,
+        removed_reason TEXT,
+        CHECK ((lag_id IS NOT NULL) + (event_id IS NOT NULL) + (intake_id IS NOT NULL) + (rule_version_id IS NOT NULL)
+               + (decision_case_id IS NOT NULL) + (obligation_id IS NOT NULL) = 1),
+        CHECK (removed_at IS NULL OR removed_reason IS NOT NULL)
+    );
+    CREATE INDEX plan_link_plan ON plan_link(plan_id);
+    CREATE INDEX plan_link_lag ON plan_link(lag_id);
+    CREATE TABLE plan_log (                 -- 계획 변경·실행 이력
+        id INTEGER PRIMARY KEY,
+        plan_id INTEGER NOT NULL REFERENCES plan(id),
+        plan_version INTEGER NOT NULL,
+        action TEXT NOT NULL,                 -- create | approve | transition | edit | complete | reopen | link | unlink | migrate
+        from_status TEXT, to_status TEXT,
+        changes TEXT NOT NULL DEFAULT '{}',   -- 바뀐 필드의 이전·새 값, 완료 시 결과·근거
+        reason TEXT,
+        actor TEXT NOT NULL REFERENCES app_user(id),
+        at TEXT NOT NULL
+    );
+    -- 회사 경계: 다른 회사의 사건·LAG·증빙·규칙을 연결할 수 없다
+    CREATE TRIGGER plan_link_company_event BEFORE INSERT ON plan_link WHEN NEW.event_id IS NOT NULL AND (SELECT company_id FROM event WHERE id=NEW.event_id) <> (SELECT company_id FROM plan WHERE id=NEW.plan_id) BEGIN SELECT RAISE(ABORT, '회사 경계를 넘는 연결입니다'); END;
+    CREATE TRIGGER plan_link_company_lag BEFORE INSERT ON plan_link WHEN NEW.lag_id IS NOT NULL AND (SELECT company_id FROM lag WHERE id=NEW.lag_id) <> (SELECT company_id FROM plan WHERE id=NEW.plan_id) BEGIN SELECT RAISE(ABORT, '회사 경계를 넘는 연결입니다'); END;
+    CREATE TRIGGER plan_link_company_intake BEFORE INSERT ON plan_link WHEN NEW.intake_id IS NOT NULL AND (SELECT e.company_id FROM intake i JOIN event e ON e.id=i.event_id WHERE i.id=NEW.intake_id) <> (SELECT company_id FROM plan WHERE id=NEW.plan_id) BEGIN SELECT RAISE(ABORT, '회사 경계를 넘는 연결입니다'); END;
+    CREATE TRIGGER plan_link_company_rule BEFORE INSERT ON plan_link WHEN NEW.rule_version_id IS NOT NULL AND (SELECT r.company_id FROM rule_version v JOIN rule r ON r.id=v.rule_id WHERE v.id=NEW.rule_version_id) <> (SELECT company_id FROM plan WHERE id=NEW.plan_id) BEGIN SELECT RAISE(ABORT, '회사 경계를 넘는 연결입니다'); END;
+    CREATE TRIGGER plan_link_company_case BEFORE INSERT ON plan_link WHEN NEW.decision_case_id IS NOT NULL AND (SELECT company_id FROM decision_case WHERE id=NEW.decision_case_id) <> (SELECT company_id FROM plan WHERE id=NEW.plan_id) BEGIN SELECT RAISE(ABORT, '회사 경계를 넘는 연결입니다'); END;
+    CREATE TRIGGER plan_link_company_obligation BEFORE INSERT ON plan_link WHEN NEW.obligation_id IS NOT NULL AND (SELECT e.company_id FROM obligation o JOIN event e ON e.id=o.event_id WHERE o.id=NEW.obligation_id) <> (SELECT company_id FROM plan WHERE id=NEW.plan_id) BEGIN SELECT RAISE(ABORT, '회사 경계를 넘는 연결입니다'); END;
+    -- 연결은 지우지 않는다(끊을 때 removed_* 를 남긴다)
+    CREATE TRIGGER plan_link_no_delete BEFORE DELETE ON plan_link BEGIN SELECT RAISE(ABORT, '연결은 삭제하지 않습니다. 사유와 함께 해제하세요'); END;
+    -- 완료(DONE)에는 해제되지 않은 완료 증빙 연결이 있어야 한다
+    CREATE TRIGGER plan_done_needs_evidence BEFORE UPDATE OF status ON plan WHEN NEW.status='DONE' AND NOT EXISTS (SELECT 1 FROM plan_link WHERE plan_id=NEW.id AND role='evidence' AND removed_at IS NULL) BEGIN SELECT RAISE(ABORT, '완료 근거(증빙 연결) 없이 DONE 으로 바꿀 수 없습니다'); END;
+    -- 완료된 계획의 조건·조치는 덮어쓸 수 없다(재개 후 새 버전으로)
+    CREATE TRIGGER plan_done_immutable BEFORE UPDATE OF done_criteria, action, purpose ON plan WHEN OLD.status='DONE' BEGIN SELECT RAISE(ABORT, '완료된 계획의 조건·조치는 바꿀 수 없습니다. 재개 후 수정하세요'); END;
+
+    -- 이관·재분류 기록: 출처 → 새 대상 (재실행해도 중복 없음)
+    CREATE TABLE reclassification (
+        id INTEGER PRIMARY KEY,
+        source_table TEXT NOT NULL,
+        source_id INTEGER NOT NULL,
+        target_layer TEXT NOT NULL,          -- OPS-PLN | OPS-LAG | TRNK-PLN | TRNK-LAG | DEV
+        target_ref TEXT,                     -- 운영 레코드 ID 또는 Docs 문서·항목 ID
+        status TEXT NOT NULL,                -- done | pending_trnk(TRNK 등록 대기)
+        reason TEXT NOT NULL,
+        actor TEXT NOT NULL REFERENCES app_user(id),
+        at TEXT NOT NULL,
+        UNIQUE (source_table, source_id)
+    );
+    ALTER TABLE lag ADD COLUMN layer TEXT NOT NULL DEFAULT 'ops';   -- ops | trnk(설계 계층으로 재분류됨)
+    """,
 ]
 
 # 이번 구현에서 명시적으로 적용하는 고정 규칙(운영 룰북 초기값)
@@ -401,6 +491,9 @@ def migrate(conn: sqlite3.Connection) -> None:
                 INITIAL_CURRICULUM)
         if i == 3:
             _migrate_0003(conn)
+        if i == 4:
+            from .plan import reclassify_legacy
+            reclassify_legacy(conn)
         if i == 2:
             conn.execute(
                 "INSERT INTO rulebook(id, scope, condition, action, basis, version, status)"

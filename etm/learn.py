@@ -441,19 +441,23 @@ def overview(conn, company_id=1) -> dict:
               for v in conn.execute("SELECT * FROM rule_version WHERE rule_id=? ORDER BY version_no DESC", (r["id"],))]
         rules.append(dict(r) | {"versions": vs})
     lags = []
-    for l in conn.execute("SELECT * FROM lag WHERE company_id=? ORDER BY CASE status WHEN 'awaiting' THEN 0 WHEN 'open'"
+    from . import plan as plan_mod
+    for l in conn.execute("SELECT * FROM lag WHERE company_id=? AND layer='ops' ORDER BY CASE status WHEN 'awaiting' THEN 0 WHEN 'open'"
                           " THEN 1 WHEN 'verifying' THEN 1 WHEN 'held' THEN 2 ELSE 3 END, id DESC", (company_id,)):
         lags.append(dict(l) | {
             "links": conn.execute("SELECT COUNT(*) FROM lag_link WHERE lag_id=?", (l["id"],)).fetchone()[0],
             "verifications": [dict(v) for v in conn.execute("SELECT * FROM verification WHERE lag_id=? ORDER BY id", (l["id"],))],
             "log": [dict(x) for x in conn.execute("SELECT * FROM lag_log WHERE lag_id=? ORDER BY id", (l["id"],))],
+            "plans": [{"id": p["id"], "title": p["title"], "status": p["status"]}
+                      for p in plan_mod.list_plans(conn, company_id, lag_id=l["id"])],
             "case_ids": [x[0] for x in conn.execute(
                 "SELECT decision_case_id FROM lag_link WHERE lag_id=? AND decision_case_id IS NOT NULL", (l["id"],))],
         })
     asked = conn.execute("SELECT COUNT(*) FROM check_item WHERE state='answered'").fetchone()[0]
     auto = conn.execute("SELECT COUNT(*) FROM rule_application WHERE result='performed'").fetchone()[0]
     pending = sum(1 for r in rules for v in r["versions"] if v["status"] == "pending")
-    return {"rules": rules, "lags": lags, "candidates": candidates(conn, company_id), "candidate_after": CANDIDATE_AFTER,
+    return {"rules": rules, "lags": lags, "plans": plan_mod.list_plans(conn, company_id),
+            "reclassification": plan_mod.reclassification_table(conn), "candidates": candidates(conn, company_id), "candidate_after": CANDIDATE_AFTER,
             "stats": {"asked": asked, "auto": auto}, "pending": pending,
             "users": [dict(u) for u in conn.execute("SELECT * FROM app_user WHERE role<>'system'")],
             "code_defaults": [dict(r) for r in conn.execute(

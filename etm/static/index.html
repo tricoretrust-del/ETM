@@ -88,13 +88,14 @@ async function refreshSide(){
   const palF = (s.rental_factory||[]).reduce((a,x)=>a+x.qty,0);
   let L = {pending:0, candidates:[], stats:{asked:0, auto:0}};
   try{ L = await api("/api/learning"); }catch(e){}
-  const todo = L.pending + L.candidates.length + (L.lags||[]).filter(x=>x.status==="awaiting").length;
+  const todo = L.pending + L.candidates.length + (L.lags||[]).filter(x=>x.status==="awaiting").length
+             + (L.plans||[]).filter(p=>p.status==="DRAFT").length;
   $("#sum").innerHTML =
     `<span title="${esc(stock)}">재고 ${s.stock.length}품목 <button onclick="showStock()">보기</button></span>`+
     `<span>받을 돈 ${won(s.receivable.known)}${s.receivable.undetermined_count?` + 미확정 ${s.receivable.undetermined_count}건`:""}</span>`+
     `<span>줄 돈 ${won(s.payable.known)}${s.payable.undetermined_count?` + 미확정 ${s.payable.undetermined_count}건`:""}</span>`+
     `<span>팔레트 공장 ${palF} · 현장 ${pal}</span>`+
-    `<span><button onclick="showLearning()">RBK·LAG</button>${todo?` <b style="color:var(--warn)">${todo}</b>`:""}`+
+    `<span><button onclick="showLearning()">RBK·PLN·LAG</button>${todo?` <b style="color:var(--warn)">${todo}</b>`:""}`+
     ` <span title="사용자에게 물은 판단 / 규칙이 처리한 판단">물음 ${L.stats.asked} · 자동 ${L.stats.auto}</span></span>`;
   window._summary = s;
   if(!h.days.length){ $("#hist").innerHTML = '<div class="empty">아직 처리한 기록이 없습니다.</div>'; return; }
@@ -155,6 +156,8 @@ async function showLearning(){
   <div class="card"><div class="title">LAG — 검증 과제</div>${o.lags.length?o.lags.map(l=>`<div style="padding:6px 0;border-bottom:1px solid var(--line)">
       <span class="chip ${l.status==="awaiting"?"open":""}">${LAG_ST[l.status]||l.status}${l.outcome?" · "+(OUT[l.outcome]||l.outcome):""}</span> LAG-${l.id} ${esc(l.question)}
       <div class="meta">근거 ${l.links}건 · 검증 ${l.verifications.length}건${l.status_reason?" · "+esc(l.status_reason):""}${l.origin?" · 출처 "+esc(l.origin):""}</div>
+      ${l.plans.length?`<div class="meta">실행계획: ${l.plans.map(p=>`<button class="link" onclick="showPlan(${p.id})">PLN-${p.id} ${esc(p.title)} (${PLN_ST[p.status]})</button>`).join(" ")}</div>`:""}
+      ${l.status!=="closed"?`<button class="link" onclick="newPlan({lag:${l.id}})">+ 실행계획</button>`:""}
       <div class="row">${l.status==="awaiting"?`<button class="primary" onclick="judge(${l.id},'rule')">규칙 반영(승인 대기 버전 생성)</button><button onclick="judge(${l.id},'rejected')">기각</button><button onclick="judge(${l.id},'hold')">보류</button>`:""}
         ${["open","verifying"].includes(l.status)&&l.case_ids.length?`<button onclick="lcmd('verify',{lag_id:${l.id},case_ids:${JSON.stringify(l.case_ids)},expected:'같은 상황에서 같은 답'})">사례 검증 기록</button>`:""}
         ${["open","verifying"].includes(l.status)?`<button class="link" onclick="judge(${l.id},'hold')">보류</button>`:""}
@@ -162,15 +165,89 @@ async function showLearning(){
       <details><summary>검증·이력</summary>${l.verifications.map(v=>`<div class="meta">검증#${v.id} ${esc(v.method)} · 기대: ${esc(v.expected)} · 관찰: ${esc(v.observed)}${v.limits?" · 한계: "+esc(v.limits):""} · ${esc(v.actor)}</div>`).join("")}
         ${l.log.map(x=>`<div class="meta">${esc(x.at.slice(5,16).replace("T"," "))} ${esc(LAG_ST[x.from_status]||"-")} → ${esc(LAG_ST[x.to_status]||x.to_status)} ${esc(x.note||"")} (${esc(x.actor)})</div>`).join("")}</details>
     </div>`).join(""):'<div class="empty">없습니다.</div>'}</div>
+  <div class="card"><div class="title">PLN — 실행계획</div>
+    ${o.plans.length?o.plans.map(p=>planRow(p)).join(""):'<div class="empty">아직 없습니다. LAG 의 "+ 실행계획" 이나 아래에서 만드세요.</div>'}
+    <div class="row"><button class="link" onclick="newPlan({})">+ 실행계획 직접 만들기</button></div></div>
   <div class="card"><div class="title">RBK — 규칙 버전</div>${live.length?live.map(({r,v})=>`<div style="padding:6px 0;border-bottom:1px solid var(--line)">
       <b>${esc(r.id)} v${v.version_no}</b> <span class="chip ${v.status==="active"?"done":""}">${V_ST[v.status]||v.status}</span> ${esc(v.description)}
       <div class="meta">${esc(scopeText(r,v))} · 적용 ${v.applied}건 · 근거: ${esc(v.basis)}</div>
       <div class="row">${v.status==="active"?`<button class="link" onclick="lcmd('set_status',{version_id:${v.id},to:'suspended'})">중지(다시 묻기)</button>`:""}
         ${v.status==="suspended"?`<button class="link" onclick="lcmd('set_status',{version_id:${v.id},to:'active'})">재개</button>`:""}
         <button class="link" onclick="traceV(${v.id})">근거 추적</button></div><div id="tr${v.id}"></div></div>`).join(""):'<div class="empty">아직 승인된 규칙이 없습니다.</div>'}</div>
+  ${o.reclassification.length?`<div class="card"><div class="title">재분류 기록 (DEV-003)</div>${o.reclassification.map(r=>`<div class="meta" style="padding:2px 0">${esc(r.source_table)}#${r.source_id} → <b>${esc(r.target_layer)}</b> ${esc(r.target_ref||"")} · ${r.status==="done"?"완료":"TRNK 등록 대기"} · ${esc(r.reason)}</div>`).join("")}</div>`:""}
   <div class="card"><div class="title">기본 동작 (코드 고정 — 규칙 아님)</div>${o.code_defaults.map(r=>`<div class="meta" style="padding:2px 0">${esc(r.moved_to.replace(/^code-default/,""))}</div>`).join("")}</div>`;
   await refreshSide();
 }
+// ---------------- 운영 PLN (DEV-003)
+const PLN_ST = {DRAFT:"초안", READY:"실행 지시됨", IN_PROGRESS:"진행 중", DONE:"완료", BLOCKED:"차단", DEFERRED:"보류", CANCELLED:"취소"};
+async function pcmd(cmd, body, after){
+  try{ await api(`/api/plans/${cmd}`, {...body, request_id: rid()}); after ? await after() : await showLearning(); }
+  catch(e){ $("#err").textContent = e.message; window.scrollTo(0,0); }
+}
+function planActions(p){
+  const b = (label, fn, cls="") => `<button class="${cls}" onclick="${fn}">${label}</button>`;
+  const ev = p.version, id = p.id, r = (to) => `askReason(${id},'${to}',${ev})`;
+  switch(p.status){
+    case "DRAFT": return b("실행 지시", `pcmd('approve',{plan_id:${id},expected_version:${ev}})`, "primary") + b("취소", r("CANCELLED"));
+    case "READY": return b("시작", `pcmd('transition',{plan_id:${id},to:'IN_PROGRESS',expected_version:${ev}})`, "primary") + b("차단", r("BLOCKED")) + b("보류", r("DEFERRED")) + b("취소", r("CANCELLED"));
+    case "IN_PROGRESS": return b("완료 등록", `completePlan(${id},${ev})`, "primary") + b("차단", r("BLOCKED")) + b("보류", r("DEFERRED")) + b("취소", r("CANCELLED"));
+    case "BLOCKED": case "DEFERRED": return b("재개", r("READY")) + b("취소", r("CANCELLED"));
+    case "DONE": return b("재개", `reopenPlan(${id},${ev})`);
+  }
+  return "";
+}
+function planRow(p){
+  return `<div style="padding:6px 0;border-bottom:1px solid var(--line)">
+    <span class="chip ${p.status==="DONE"?"done":(p.status==="DRAFT"?"open":"")}">${PLN_ST[p.status]}</span> <button class="link" onclick="showPlan(${p.id})">PLN-${p.id}</button> ${esc(p.title)}
+    <div class="meta">조치: ${esc(p.action||"미정")} · 완료 조건: ${esc(p.done_criteria||"미정")}${p.assignee?" · 담당 "+esc(p.assignee):""}${p.due_date?" · 기한 "+esc(p.due_date):""}${p.status_reason?" · 사유: "+esc(p.status_reason):""}</div>
+    ${p.result?`<div class="meta">결과: ${esc(p.result)}</div>`:""}
+    <div class="meta">연결: ${p.links.filter(l=>!l.removed_at).map(l=>`${({basis:"근거",target:"대상",evidence:"증빙"})[l.role]} ${esc(l.target)}`).join(" · ")||"없음"}</div>
+    <div class="row">${planActions(p)}</div></div>`;
+}
+async function showPlan(id){
+  current = null;
+  const p = await api(`/api/plans/${id}`);
+  $("#left").innerHTML = `<div class="row" style="margin:0 0 8px"><button class="link" onclick="showLearning()">← RBK·PLN·LAG</button></div>
+    <div class="err" id="err"></div>
+    <div class="card"><div class="title">PLN-${p.id} ${esc(p.title)}</div>
+      <table>${[["상태",PLN_ST[p.status]+(p.status_reason?` (${p.status_reason})`:"")],["목적",p.purpose],["조치",p.action],["완료 조건",p.done_criteria],["담당",p.assignee],["기한",p.due_date],
+        ["실행 지시",p.approved_by?`${p.approved_by} ${p.approved_at}`:"없음"],["결과",p.result],["완료",p.done_at],["버전",p.version],["출처",p.origin]].map(([k,v])=>`<tr><td>${k}</td><td>${esc(v??"-")}</td></tr>`).join("")}</table>
+      <div class="row">${planActions(p)}</div>
+      <div class="title" style="margin-top:10px">연결</div>
+      ${p.links.map(l=>`<div class="meta">${({basis:"근거",target:"대상",evidence:"증빙"})[l.role]} · ${l.kind==="event"?`<button class="link" onclick="openEvent(${l.target_id})">${esc(l.target)}</button>`:esc(l.target)}${l.removed_at?` · <s>해제됨</s> (${esc(l.removed_reason)})`:(p.status==="DONE"&&l.role==="evidence"?"":` <button class="link" onclick="unlinkPlan(${l.id},${p.id})">해제</button>`)}</div>`).join("")||'<div class="meta">없음</div>'}
+      <div class="row"><button class="link" onclick="linkPlan(${p.id})">+ 사건 연결</button></div>
+      <details><summary>변경·실행 이력 ${p.log.length}건</summary>${p.log.map(x=>`<div class="meta">${esc(x.at.slice(5,16).replace("T"," "))} v${x.plan_version} ${esc(x.action)} ${x.from_status!==x.to_status?esc((PLN_ST[x.from_status]||"-")+" → "+(PLN_ST[x.to_status]||"")):""} ${esc(x.reason||"")} (${esc(x.actor)}) ${x.changes!=="{}"?`<span title='${esc(x.changes)}'>· 변경 내용</span>`:""}</div>`).join("")}</details>
+    </div>`;
+  await refreshSide();
+}
+async function newPlan(ctx){
+  const title = prompt("실행계획 제목 (무엇을 할지)"); if(!title) return;
+  const action = prompt("조치 내용 (비워 두면 미정)", "") || null;
+  const done = prompt("완료 조건 (무엇으로 완료를 판단할지, 비워 두면 미정)", "") || null;
+  const links = [];
+  if(ctx.lag) links.push({role:"basis", kind:"lag", id:ctx.lag});
+  if(ctx.event) links.push({role:"target", kind:"event", id:ctx.event});
+  const now = action ? confirm("지금 실행을 지시할까요? (취소를 누르면 초안으로 저장)") : false;
+  await pcmd("create", {title, action, done_criteria: done, links, execute_now: now}, ctx.event ? () => openEvent(ctx.event) : null);
+}
+async function newLag(eventId){
+  const q = prompt("이 사건에서 생긴 질문·문제 (무엇을 아직 모르는가)"); if(!q) return;
+  try{ await api("/api/learning/create_lag", {request_id: rid(), question:q, context:{}, event_ids:[eventId]}); await openEvent(eventId); }
+  catch(e){ $("#err").textContent = e.message; }
+}
+function askReason(id, to, ev){ const reason = prompt(`${PLN_ST[to]} 사유`); if(reason===null) return; pcmd("transition", {plan_id:id, to, reason, expected_version:ev}); }
+async function completePlan(id, ev){
+  const p = await api(`/api/plans/${id}`);
+  const result = prompt("실행 결과"); if(!result) return;
+  // 이미 연결된 사건·증빙을 완료 근거로 재사용(다시 입력하지 않음). 없으면 사건 번호를 받는다.
+  let evidence = p.links.filter(l=>!l.removed_at && ["event","intake"].includes(l.kind)).map(l=>({kind:l.kind, id:l.target_id}));
+  if(!evidence.length){ const n = prompt("완료 근거가 될 사건 번호 (예: 12)"); if(!n) return; evidence = [{kind:"event", id:Number(n)}]; }
+  pcmd("complete", {plan_id:id, result, evidence, expected_version:ev}, () => showPlan(id));
+}
+function reopenPlan(id, ev){ const reason = prompt("재개 사유"); if(!reason) return; pcmd("reopen", {plan_id:id, reason, expected_version:ev}, () => showPlan(id)); }
+function linkPlan(id){ const n = prompt("연결할 사건 번호"); if(!n) return; pcmd("link", {plan_id:id, role:"target", kind:"event", id:Number(n)}, () => showPlan(id)); }
+function unlinkPlan(lid, pid){ const reason = prompt("해제 사유"); if(!reason) return; pcmd("unlink", {link_id:lid, reason}, () => showPlan(pid)); }
+
 async function regLag(i){
   const c = window._cands[i];
   try{
@@ -270,6 +347,9 @@ async function openEvent(id, note){
       </table>
       ${readOnly?"":`<div class="meta" style="margin-top:6px">숫자 옆 <b>수정</b>을 누르면 차이만 다시 반영합니다(이력 보존).</div>`}
     </details>
+    <div class="meta" style="margin-top:6px">${(d.plans||[]).map(p=>`<button class="link" onclick="showPlan(${p.id})">PLN-${p.id} ${esc(p.title)} (${PLN_ST[p.status]})</button>`).join(" ")}
+      <button class="link" onclick="newPlan({event:${d.id}})">+ 실행계획</button>
+      <button class="link" onclick="newLag(${d.id})">+ LAG(질문)</button></div>
     ${(d.rule_applications||[]).length?`<details><summary>규칙 적용 근거 ${d.rule_applications.length}건</summary>${d.rule_applications.map(a=>`<div class="meta">${esc(a.rule)} · ${esc(a.target)} · ${esc(({performed:"자동 처리",required_confirm:"확인 요구",held_conflict:"충돌로 보류"})[a.result]||a.result)} · ${esc(a.reason)} · 사건 리비전 ${a.event_revision}</div>`).join("")}</details>`:""}
     <details><summary>원본·처리 이력</summary>
       ${d.history.map(h=>`<div class="meta">${esc(h.at.replace("T"," ").slice(5,16))} ${esc(h.summary)}</div>`).join("")}

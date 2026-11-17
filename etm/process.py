@@ -1141,6 +1141,8 @@ def event_detail(conn, event_id) -> dict:
             (event_id,))],
         "moves": moves, "claims": claims,
         "company_id": ev["company_id"], "revision": ev["revision"], "kind": ev["kind"],
+        "plans": [{"id": p["id"], "title": p["title"], "status": p["status"]}
+                  for p in __import__("etm.plan", fromlist=["list_plans"]).list_plans(conn, ev["company_id"], event_id=event_id)],
         "rule_applications": [dict(r) for r in conn.execute(
             "SELECT a.*, v.rule_id || ' v' || v.version_no AS rule, v.description FROM rule_application a"
             " JOIN rule_version v ON v.id=a.rule_version_id WHERE a.event_id=? ORDER BY a.id", (event_id,))],
