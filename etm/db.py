@@ -531,6 +531,10 @@ MIGRATIONS: list[str] = [
     ALTER TABLE decision_case ADD COLUMN dialog_id INTEGER REFERENCES dialog(id);
     ALTER TABLE company ADD COLUMN aliases TEXT NOT NULL DEFAULT '[]';   -- 자사 판별용(문서에 나오는 자사 이름)
     """,
+    # ---- 0007: 판단 조건 단일화 (사례 키를 표준 사실 JSON 으로) ---------------------
+    """
+    CREATE INDEX IF NOT EXISTS idx_case_key ON decision_case(company_id, decision_kind, decision_key);
+    """,
 ]
 
 # 이번 구현에서 명시적으로 적용하는 고정 규칙(운영 룰북 초기값)
@@ -589,6 +593,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         if i == 4:
             from .plan import reclassify_legacy
             reclassify_legacy(conn)
+        if i == 7:
+            _migrate_0007(conn)
         if i == 2:
             conn.execute(
                 "INSERT INTO rulebook(id, scope, condition, action, basis, version, status)"
@@ -596,6 +602,29 @@ def migrate(conn: sqlite3.Connection) -> None:
                 "'그 기준정보로 연결한다(묻지 않음)','v0.1 구현 기본값 — TRNK 검토 필요','v0.1','active')")
         conn.execute(f"PRAGMA user_version = {i}")
         conn.execute("COMMIT")
+
+
+def _migrate_0007(conn) -> None:
+    """이전 형식 사례 키를 표준 사실 키로 바꾼다. 이전 규칙 버전(불변)은 그대로 두며 호환 사실(form_key)로 계속 맞는다.
+    - item_map '업체|품목' → {supplier, item_text}
+    - doc_kind 문답 사례(업체) → {supplier, marker(문답 원문)} / 기존 접수 사례(양식 키) → {form_key}"""
+    import json
+    from .learn import case_key, doc_marker, facts_from_key
+    for r in conn.execute("SELECT c.id, c.decision_kind, c.decision_key, d.raw_input FROM decision_case c"
+                          " LEFT JOIN dialog d ON d.id=c.dialog_id").fetchall():
+        k = r["decision_key"] or ""
+        if k.startswith("{") or r["decision_kind"] not in ("doc_kind", "item_map"):
+            continue
+        if r["decision_kind"] == "doc_kind" and r["raw_input"] is not None:
+            f = {"supplier": k, "marker": doc_marker(r["raw_input"])}
+        else:
+            f = facts_from_key(r["decision_kind"], k)
+        conn.execute("UPDATE decision_case SET decision_key=? WHERE id=?", (case_key(f), r["id"]))
+    for r in conn.execute("SELECT id, context FROM lag").fetchall():
+        ctx = json.loads(r["context"] or "{}")
+        if ctx.get("decision") in ("doc_kind", "item_map") and ctx.get("key") and not ctx["key"].startswith("{"):
+            ctx["key"] = case_key(facts_from_key(ctx["decision"], ctx["key"]))
+            conn.execute("UPDATE lag SET context=? WHERE id=?", (json.dumps(ctx, ensure_ascii=False), r["id"]))
 
 
 def _migrate_0003(conn) -> None:

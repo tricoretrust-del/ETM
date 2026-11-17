@@ -31,21 +31,10 @@ KIND_WORDS = {"shipment": ("출하", "송장"), "receipt": ("입고",), "return"
 YES = re.compile(r"^\s*(맞(음|아|아요|습니다)?|네|예|응|ㅇㅇ|ok|yes|그래|그렇다|맞다)\s*[.!]?\s*$", re.I)
 YES_PREFIX = re.compile(r"^\s*(맞(음|아|아요|습니다)?|네|예|응|그래|맞다)\s*[.,!]\s*\S", re.I)
 NO_EFFECT_ITEM = "none"
-MARKER_WORDS = ("출하", "송장", "입고", "반납", "회수", "반품", "명세서")
-MARKER_KIND = {"출하": "shipment", "송장": "shipment", "입고": "receipt", "반납": "return", "회수": "return", "반품": "return"}
+doc_marker = learn.doc_marker
+_marker_conflicts = learn.marker_conflicts
 
 
-def doc_marker(raw: str) -> str:
-    """원문에 나타난 문서 종류 표지. 규칙 조건과 충돌 검사에 쓴다(보낸 업체 하나만으로 일치시키지 않기 위해)."""
-    found = sorted({w for w in MARKER_WORDS if w in (raw or "")})
-    return "·".join(found) or "없음"
-
-
-def _marker_conflicts(raw: str, kind: str) -> list[str]:
-    return sorted({w for w, k in MARKER_KIND.items() if w in (raw or "") and k != kind})
-
-
-# --------------------------------------------------------------------------- 조회
 def _dialog(conn, did):
     d = conn.execute("SELECT * FROM dialog WHERE id=?", (did,)).fetchone()
     if not d:
@@ -96,7 +85,8 @@ def _context(conn, d) -> tuple[dict, list[str]]:
     cases = []
     for r in conn.execute("SELECT * FROM decision_case WHERE company_id=? AND decision_kind IN ('doc_kind','item_map')"
                           " ORDER BY id DESC LIMIT 200", (company,)):
-        key_parts = [p for p in re.split(r"[|·]", r["decision_key"]) if p]
+        f = learn.facts_from_key(r["decision_kind"], r["decision_key"])
+        key_parts = [str(v) for k, v in f.items() if k != "marker" and v]
         if not any(len(p) >= 2 and norm(p) in raw_n for p in key_parts):
             continue
         cases.append({"ref": f"case:{r['id']}", "decision": r["decision_kind"], "situation": r["label"],
@@ -306,12 +296,17 @@ def _process_response(conn, d, resp, request_id):
         # 사용자 답의 해석(가설)과 처리 동작이 어긋나면 가설을 따른다. 반납은 처리 엔진이 없으므로 보관만.
         kind = hk
         pp = dict(pp, action={"shipment": "shipment_apply", "receipt": "receipt_record"}.get(hk, "keep_only"))
-    if kind and pp["kind_source"] == "user_answer" and last_a is not None and "kind" not in state:
+    kind_q = last_a is not None and conn.execute("SELECT 1 FROM dialog_question WHERE id=? AND target='kind'",
+                                                 (last_a["question_id"],)).fetchone()
+    if kind and (pp["kind_source"] == "user_answer" or kind_q) and last_a is not None and "kind" not in state:
+        # 방금 '종류' 질문에 사용자가 답했고 그 해석으로 처리안이 나왔으면 사용자 답으로 본다(같은 질문 반복 방지)
         state["kind"] = {"value": kind, "source": "user_answer", "answer_id": last_a["id"], "via": "api_interpretation"}
     if last_a is not None:
         for i, ln in enumerate(pp.get("lines") or []):
             ref = ln.get("item_ref")
-            if ln.get("item_source") == "user_answer" and ref and str(i) not in state.get("items", {}):
+            answered_this = conn.execute("SELECT 1 FROM dialog_question WHERE id=? AND target=?",
+                                         (last_a["question_id"], f"lines.{i}.item")).fetchone()
+            if ref and (ln.get("item_source") == "user_answer" or answered_this) and str(i) not in state.get("items", {}):
                 state.setdefault("items", {})[str(i)] = {"choice": ref, "source": "user_answer", "answer_id": last_a["id"],
                                                           "via": "api_interpretation"}
     if resp["status"] in ("unsupported", "no_effect") and "kind" not in state and pp["action"] == "none":
@@ -358,6 +353,9 @@ def _kind_known(conn, d, pp, state):
         if k.get("via") == "api_interpretation" and _marker_conflicts(d["raw_input"], k["value"]):
             return None   # 모델이 해석한 답이 원문 표지와 충돌 → 다시 확인
         return k
+    rk = _rule_kind(conn, d, pp)
+    if rk and "value" in rk:   # 승인된 규칙의 조건 범위 안 → 재사용 처리 근거
+        return rk
     kind = ACTION_TO_KIND.get(pp["action"])
     if not kind:
         return None
@@ -366,20 +364,26 @@ def _kind_known(conn, d, pp, state):
         return None
     if src == "document" and any(w in d["raw_input"] for w in KIND_WORDS.get(kind, ())):
         return {"value": kind, "source": "document"}
-    if src == "rbk":
-        sup = norm(pp.get("counterparty") or "")
-        for ref in pp.get("kind_refs") or []:
-            m = re.fullmatch(r"rule:(\d+)", ref)
-            if not m:
-                continue
-            v = conn.execute("SELECT v.*, r.decision, r.company_id FROM rule_version v JOIN rule r ON r.id=v.rule_id"
-                             " WHERE v.id=? AND v.status='active'", (int(m[1]),)).fetchone()
-            if not v or v["decision"] != "doc_kind" or v["company_id"] not in (None, d["company_id"]):
-                continue
-            cond, act = json.loads(v["condition"]), json.loads(v["action"])
-            if (cond.get("supplier") and cond["supplier"] == sup and cond.get("marker") == doc_marker(d["raw_input"])
-                    and KIND_TO_DOC.get(kind) == act.get("value") and not _marker_conflicts(d["raw_input"], kind)):
-                return {"value": kind, "source": "rbk", "rule_version_id": v["id"]}
+    return None
+
+
+def _doc_facts(d, pp) -> dict:
+    """규칙 조건 사실(learn.facts_for 단일 정의) + 이전 형식 규칙 호환용 양식 키."""
+    f = learn.facts_for("doc_kind", supplier=pp.get("counterparty") or "", raw=d["raw_input"])
+    fk = json.loads(d["extracted"] or "{}").get("form_key")
+    return {**f, "form_key": fk} if fk else f
+
+
+def _rule_kind(conn, d, pp):
+    """서버가 직접 활성 규칙을 찾는다(모델이 규칙을 인용했는지와 무관). 경로(직접 지시/LAG 판정)와 무관하게 같은 절차."""
+    status, action, ver, basis = learn.decide(conn, event={"company_id": d["company_id"], "trade_date": pp.get("trade_date")},
+                                              decision="doc_kind", facts=_doc_facts(d, pp), raw=d["raw_input"])
+    if status == "rule":
+        kind = learn.DOC_TO_KIND.get(action["value"])
+        if kind:
+            return {"value": kind, "source": "rbk", "rule_version_id": ver["id"], "basis": basis}
+    if status == "conflict":
+        return {"conflict": basis}
     return None
 
 
@@ -387,19 +391,35 @@ def _item_known(conn, ln, idx, state, company=1, supplier=""):
     s = state.get("items", {}).get(str(idx))
     if s:
         return s
-    facts = {"supplier": norm(supplier), "item_text": norm(ln["item_text"])}
-    for v in conn.execute("SELECT v.* FROM rule_version v JOIN rule r ON r.id=v.rule_id WHERE v.status='active' AND"
-                          " r.decision='item_map' AND (r.company_id=? OR r.company_id IS NULL)", (company,)):
-        if json.loads(v["condition"]) == facts:
-            act = json.loads(v["action"])
-            return {"choice": act["choice"], "source": "rbk", "rule_version_id": v["id"]}
-    ref = ln.get("item_ref")
-    if ref and ln.get("item_source") == "master_exact":
-        m = re.fullmatch(r"item:(\d+)", ref)
-        r = conn.execute("SELECT * FROM item WHERE id=?", (int(m[1]),)).fetchone() if m else None
-        if r and norm(ln["item_text"]) in [norm(x) for x in (r["name"], r["code"] or "", *json.loads(r["aliases"] or "[]")) if x]:
-            return {"choice": ref, "source": "master_exact"}
+    facts = learn.facts_for("item_map", supplier=supplier, item_text=ln["item_text"])
+    status, action, ver, basis = learn.decide(conn, event={"company_id": company, "trade_date": None},
+                                              decision="item_map", facts=facts)
+    if status == "rule":
+        return {"choice": action["choice"], "source": "rbk", "rule_version_id": ver["id"], "basis": basis}
+    if status == "conflict":
+        return None
+    from .receipt import _exact_item   # 기준정보 정확 일치는 서버가 직접 확인(모델의 item_ref 를 믿지 않음)
+    r = _exact_item(conn, ln["item_text"])
+    if r:
+        return {"choice": f"item:{r['id']}", "source": "master_exact"}
     return None
+
+
+def _named_parties(conn, d, selfn) -> list[str]:
+    """원문에 이름이 그대로 나오는 알려진 상대 업체(기준정보 거래처 + 사용자가 확정한 사례의 업체)."""
+    raw_n = norm(d["raw_input"])
+    names = {}
+    for r in conn.execute("SELECT name, aliases FROM party"):
+        for x in [r["name"], *json.loads(r["aliases"] or "[]")]:
+            if x and len(norm(x)) >= 2 and norm(x) in raw_n:
+                names[norm(r["name"])] = r["name"]
+    for r in conn.execute("SELECT decision_kind, decision_key FROM decision_case WHERE company_id=? AND rule_version_id IS NULL",
+                          (d["company_id"],)):
+        sup = learn.facts_from_key(r["decision_kind"], r["decision_key"]).get("supplier")
+        if sup and len(sup) >= 2 and sup in raw_n and sup not in names:
+            m = re.search(re.escape(sup), d["raw_input"], re.I)   # 원문에 적힌 표기 그대로 쓴다
+            names[sup] = m[0] if m else sup
+    return [v for k, v in names.items() if k not in selfn]
 
 
 def _self_names(conn, company):
@@ -414,6 +434,19 @@ def _gate_and_apply(conn, did, pid):
     if state.get("counterparty"):
         pp["counterparty"] = state["counterparty"]["value"]
     selfn = _self_names(conn, d["company_id"])
+    if not (pp.get("counterparty") or "").strip() and pp["action"] != "keep_only" \
+            and (state.get("kind") or {}).get("value") != "other":
+        named = _named_parties(conn, d, selfn)
+        if len(named) == 1:   # 원문에 이름이 그대로 적힌 알려진 업체가 하나뿐 → 원문 명시로 본다
+            pp["counterparty"] = named[0]
+            state["counterparty"] = {"value": named[0], "source": "document_name"}
+            _set_state(conn, did, state)
+        else:                 # 상대 업체는 규칙 조건의 핵심. 추측하지 않고 묻는다
+            ext = json.loads(d["extracted"] or "{}")
+            opts = [x for x in (ext.get("supplier"), ext.get("customer"), *named) if x and norm(x) not in selfn]
+            _ask(conn, did, d["revision"], "srv-counterparty", "counterparty", "missing",
+                 "이 자료의 상대 업체(보낸 곳 또는 받는 곳)는 누구인가요?", list(dict.fromkeys(opts)), None, "server")
+            return
     if pp.get("counterparty") and norm(pp["counterparty"]) in selfn:
         ext = json.loads(d["extracted"] or "{}")
         opts = [x for x in (pp.get("receiver"), ext.get("supplier"), ext.get("customer")) if x and norm(x) not in selfn]
@@ -421,12 +454,11 @@ def _gate_and_apply(conn, did, pid):
              f"상대방이 자사({pp['counterparty']})로 해석됐습니다. 이 자료의 상대 업체는 누구인가요?",
              list(dict.fromkeys(opts)), None, "server")
         return
-    if pp["action"] == "none" and "kind" not in state:
-        hyp = json.loads(d["hypothesis"] or "{}")
+    known = _kind_known(conn, d, pp, state)
+    if not known and pp["action"] == "none":
         _ask(conn, did, d["revision"], "srv-kind", "kind", "unknown_meaning", "이 자료는 무엇인가요?",
              list(KIND_CHOICES), None, "server")
         return
-    known = _kind_known(conn, d, pp, state)
     if not known:
         kind = ACTION_TO_KIND.get(pp["action"], "other")
         hyp = json.loads(d["hypothesis"] or "{}")
@@ -585,28 +617,34 @@ def _apply(conn, did, pid, pp, state):
     sup = norm(pp.get("counterparty") or "")
     k = state["kind"]
     label = f"{pp.get('counterparty') or '상대 미상'} 자료의 종류"
+    dkey = learn.case_key(learn.facts_for("doc_kind", supplier=pp.get("counterparty") or "", raw=raw))
+    cid = None
     if k["source"] == "rbk":
         learn.record_application(conn, event_id=ev, version_id=k["rule_version_id"], target="doc_kind",
-                                 basis={"supplier": sup, "dialog": did}, snapshot={"raw_head": d["raw_input"][:200]},
+                                 basis={**(k.get("basis") or {}), "dialog": did}, snapshot={"raw_head": raw[:200]},
                                  result="performed", reason=KIND_LABEL[kind])
-        cid = learn.record_case(conn, event_id=ev, check_id=None, kind="doc_kind", key=sup or "unknown", label=label,
+        cid = learn.record_case(conn, event_id=ev, check_id=None, kind="doc_kind", key=dkey, label=label,
                                 answer=KIND_TO_DOC[kind], actor="system", version_id=k["rule_version_id"],
                                 company_id=d["company_id"])
-    else:
-        cid = learn.record_case(conn, event_id=ev, check_id=None, kind="doc_kind", key=sup or "unknown", label=label,
+    elif k["source"] == "user_answer":   # 사용자가 판단한 것만 사례(학습 재료)로 남긴다. 원문 표기로 정해진 것은 사례 아님
+        cid = learn.record_case(conn, event_id=ev, check_id=None, kind="doc_kind", key=dkey, label=label,
                                 answer=KIND_TO_DOC[kind], actor=d["created_by"], company_id=d["company_id"])
-    conn.execute("UPDATE decision_case SET dialog_id=? WHERE id=?", (did, cid))
+    if cid:
+        conn.execute("UPDATE decision_case SET dialog_id=? WHERE id=?", (did, cid))
     for i, s in (state.get("items") or {}).items():
         if s.get("source") == "rbk":
             learn.record_application(conn, event_id=ev, version_id=s["rule_version_id"], target=f"lines.{i}.item",
-                                     basis={"supplier": sup, "dialog": did}, snapshot={"item": pp["lines"][int(i)]["item_text"]},
+                                     basis={**(s.get("basis") or {}), "dialog": did},
+                                     snapshot={"item": pp["lines"][int(i)]["item_text"]},
                                      result="performed", reason=s["choice"])
         if s.get("source") == "user_answer":
             ln = pp["lines"][int(i)]
             r_ = conn.execute("SELECT name FROM item WHERE id=?", (int(s["choice"].split(":")[1]),)).fetchone() \
                 if str(s["choice"]).startswith("item:") else None
             lab = r_["name"] if r_ else "재고와 무관"
-            c2 = learn.record_case(conn, event_id=ev, check_id=None, kind="item_map", key=f"{sup}|{norm(ln['item_text'])}",
+            c2 = learn.record_case(conn, event_id=ev, check_id=None, kind="item_map",
+                                   key=learn.case_key(learn.facts_for("item_map", supplier=pp.get("counterparty") or "",
+                                                                      item_text=ln["item_text"])),
                                    label=f"{pp.get('counterparty') or ''} 자료의 품목 '{ln['item_text']}'",
                                    answer={"choice": s["choice"], "label": lab}, actor=d["created_by"],
                                    company_id=d["company_id"])
@@ -646,14 +684,15 @@ def accept_candidate(conn, *, candidate_id: int, actor: str) -> dict:
                         if str(ch).startswith("item:") else "재고와 무관"
                     made.append(learn.directive_rule(
                         conn, actor=actor, company_id=d["company_id"], decision="item_map",
-                        condition={"supplier": sup, "item_text": norm(ln["item_text"])},
+                        condition=learn.facts_for("item_map", supplier=pp.get("counterparty") or "",
+                                                  item_text=ln["item_text"]),
                         action={"type": "map_item", "choice": ch, "label": nm},
                         title=f"{pp.get('counterparty')} 자료의 '{ln['item_text']}' → {nm}",
                         instruction=ans["raw_text"], answer_id=ans["id"], event_id=d["event_id"]))
             else:            # 그 밖에는 자료 종류(방향) 규칙
                 made.append(learn.directive_rule(
                     conn, actor=actor, company_id=d["company_id"], decision="doc_kind",
-                    condition={"supplier": sup, "marker": doc_marker(d["raw_input"])},
+                    condition=learn.facts_for("doc_kind", supplier=pp.get("counterparty") or "", raw=d["raw_input"]),
                     action={"type": "set_doc_kind", "value": KIND_TO_DOC[st["kind"]["value"]]},
                     title=f"{pp.get('counterparty')} 자료 → {KIND_LABEL[st['kind']['value']]}",
                     instruction=ans["raw_text"], answer_id=ans["id"], event_id=d["event_id"]))

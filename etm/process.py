@@ -692,16 +692,21 @@ def _intake_tx(conn, payload: dict, decided_by: str | None = None) -> dict:
 
     # (b) 자료 종류(=가치 이동 방향)가 정해지지 않은 텍스트: 규칙이 있으면 규칙대로, 없으면 사용자에게 묻는다
     if not payload.get("doc_type") and payload.get("raw_text"):
-        key = payload.get("form_key") or ""
-        label = f"항목 구성이 [{key or '없음'}]인 자료"
+        form_key = payload.get("form_key") or ""
         company = int(payload.get("company_id") or 1)
+        party = _doc_party(conn, payload, company)
+        canon = learn.facts_for("doc_kind", supplier=party, raw=payload["raw_text"])
+        key = learn.case_key(canon)
+        label = f"{party or '상대 미상'} 자료(표지 {canon['marker']})"
+        # 표준 사실 + 이전 형식 규칙 호환용 양식 키. 원문 표지와 다른 방향의 규칙은 적용하지 않는다.
         status, action, ver, basis = learn.decide(conn, event={"company_id": company, "trade_date": None},
-                                                  decision="doc_kind", facts={"form_key": key})
+                                                  decision="doc_kind", facts={**canon, "form_key": form_key},
+                                                  raw=payload["raw_text"])
         if status == "rule":
             kind = action["value"]
             res = _intake_tx(conn, _rebuild(conn, payload, kind), decided_by=learn.version_label(ver))
             learn.record_application(conn, event_id=res["event_id"], version_id=ver["id"], target="doc_kind",
-                                     basis=basis, snapshot={"form_key": key}, result="performed",
+                                     basis=basis, snapshot={**canon, "form_key": form_key}, result="performed",
                                      reason=contract.DOC_KIND_CHOICES[kind])
             learn.record_case(conn, event_id=res["event_id"], check_id=None, kind="doc_kind", key=key, label=label,
                               answer=kind, actor="system", version_id=ver["id"], company_id=company)
@@ -792,6 +797,17 @@ def _finish_intake(conn, ev_id, header, outcome, by_rule=""):
     return {"event_id": ev_id, "outcome": outcome, "checks": _checks_out(conn, ev_id)}
 
 
+def _doc_party(conn, payload, company=1) -> str:
+    """자료에 적힌 상대 업체(자사 이름 제외). 종류가 정해지기 전이라 보낸 쪽/받는 쪽 구분 없이 고른다."""
+    r = conn.execute("SELECT name, aliases FROM company WHERE id=?", (company,)).fetchone()
+    selfn = {norm(x) for x in ([r["name"], *json.loads(r["aliases"] or "[]")] if r else []) if x}
+    for k in ("supplier", "customer"):
+        v = payload.get(k)
+        if v and norm(v) not in selfn:
+            return v
+    return ""
+
+
 def _pending_kind(conn, payload, h, key, label, conflict=None):
     """자료 종류를 사용자에게 묻는다. 미리보기용 해석은 저장하지만 아무것도 반영하지 않는다."""
     from . import learn
@@ -816,7 +832,7 @@ def _pending_kind(conn, payload, h, key, label, conflict=None):
     if conflict:
         for v in conflict[0]:
             learn.record_application(conn, event_id=ev_id, version_id=v["id"], target="doc_kind", basis={"conflict": True},
-                                     snapshot={"form_key": key}, result="held_conflict", reason=conflict[1])
+                                     snapshot={"key": key}, result="held_conflict", reason=conflict[1])
     log(conn, ev_id, "intake", f"접수 · 자료 종류 확인 대기 · {_preview(fields)}")
     return {"event_id": ev_id, "outcome": "pending", "checks": _checks_out(conn, ev_id)}
 

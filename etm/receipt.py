@@ -17,9 +17,13 @@ from .process import (LABEL, _blocked_paths, _lbl, describe_changes, is_resolved
                       norm, now, open_checks, save_fields, _aliases)
 
 
-def item_key(fields, i) -> str:
+def item_facts(fields, i) -> dict:
     sup = (fields.get("supplier") or {}).get("value") or (fields.get("customer") or {}).get("value") or ""
-    return f"{norm(sup)}|{norm(fields[f'lines.{i}.item']['value'])}"
+    return learn.facts_for("item_map", supplier=sup, item_text=fields[f"lines.{i}.item"]["value"])
+
+
+def item_key(fields, i) -> str:
+    return learn.case_key(item_facts(fields, i))
 
 
 def _exact_item(conn, text):
@@ -66,9 +70,9 @@ def required_checks(conn, ev, fields) -> list[dict]:
             if row:   # 기본 동작(code-default): 기준정보 이름·코드·별칭 정확 일치
                 it.update(ref=row["id"], value=row["name"], ref_source="code:MASTER-EXACT")
             else:
-                sup, _, item_text = key.partition("|")
-                status, action, ver, basis = learn.decide(conn, event=ev, decision="item_map",
-                                                          facts={"supplier": sup, "item_text": item_text})
+                f = item_facts(fields, i)
+                sup = f["supplier"]
+                status, action, ver, basis = learn.decide(conn, event=ev, decision="item_map", facts=f)
                 if status == "rule":
                     _set_item(conn, it, action, f"rule:{learn.version_label(ver)}")
                     learn.record_application(conn, event_id=ev["id"], version_id=ver["id"], target=f"lines.{i}.item",

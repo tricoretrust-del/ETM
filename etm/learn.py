@@ -19,7 +19,66 @@ from __future__ import annotations
 import json
 from collections import Counter, defaultdict
 
-CANDIDATE_AFTER = 3  # 후보 제시 기준(잠정). 승격 기준 자체는 LAG-001 / TRNK 결정 사항
+CANDIDATE_AFTER = 3
+# ---------------------------------------------------------------------------- 판단 조건(사실) — 단일 정의
+# 사례 저장·LAG 판정 초안·사용자 지시 규칙·규칙 적용(문답/기존 접수) 이 모두 이 함수로 조건을 만든다.
+# 같은 판단이면 어느 경로로 만든 규칙이든 같은 모양의 조건이 되어 같은 절차(decide)로 적용된다.
+MARKER_WORDS = ("출하", "송장", "입고", "반납", "회수", "반품", "명세서")
+MARKER_KIND = {"출하": "shipment", "송장": "shipment", "입고": "receipt", "반납": "return", "회수": "return", "반품": "return"}
+
+
+def _norm(s):
+    from .process import norm
+    return norm(s or "")
+
+
+def doc_marker(raw: str) -> str:
+    """원문에 나타난 문서 종류 표지(예: '입고', '반납', '출하·송장'). 없으면 '없음'."""
+    return "·".join(sorted({w for w in MARKER_WORDS if w in (raw or "")})) or "없음"
+
+
+def facts_for(decision: str, *, supplier: str = "", item_text: str = "", raw: str = "") -> dict:
+    """규칙 조건·사례 키로 쓰는 표준 사실. doc_kind = {상대 업체, 원문 표지}, item_map = {상대 업체, 품목 원문}."""
+    if decision == "doc_kind":
+        return {"supplier": _norm(supplier), "marker": doc_marker(raw)}
+    if decision == "item_map":
+        return {"supplier": _norm(supplier), "item_text": _norm(item_text)}
+    raise ValueError(f"사실을 만들 수 없는 판단 종류: {decision}")
+
+
+DOC_TO_KIND = {"shipment_invoice": "shipment", "receipt": "receipt", "other": "other"}
+
+
+def marker_conflicts(raw: str, kind_or_doc: str | None) -> list[str]:
+    """원문 표지 중 주어진 방향과 다른 것. kind 는 shipment/receipt/return/other 또는 문서 종류값."""
+    kind = DOC_TO_KIND.get(kind_or_doc, kind_or_doc)
+    if kind == "other":   # 보관만은 장부를 바꾸지 않으므로 어느 표지와도 충돌하지 않는다
+        return []
+    return sorted({w for w, k in MARKER_KIND.items() if w in (raw or "") and k != kind})
+
+
+def case_key(facts: dict) -> str:
+    return json.dumps(facts, ensure_ascii=False, sort_keys=True)
+
+
+def facts_from_key(kind, key):
+    """사례 키 → 조건 사실. 표준 키는 JSON. 0007 이전 키는 호환 해석(양식 키 / '업체|품목')."""
+    if key and key.startswith("{"):
+        return json.loads(key)
+    if kind == "doc_kind":
+        return {"form_key": key}
+    if kind == "item_map":
+        sup, _, item = (key or "").partition("|")
+        return {"supplier": sup, "item_text": item}
+    return {}
+
+
+def require_specific(decision: str, condition: dict) -> None:
+    """범위가 사실상 '모든 자료'가 되는 규칙은 만들지 않는다."""
+    if decision == "doc_kind" and not (condition.get("supplier") or condition.get("form_key")):
+        raise Conflict("상대 업체가 확정되지 않은 사례라 규칙 범위를 정할 수 없습니다")
+    if decision == "item_map" and not condition.get("item_text"):
+        raise Conflict("품목 원문이 없어 규칙 범위를 정할 수 없습니다")  # 후보 제시 기준(잠정). 승격 기준 자체는 LAG-001 / TRNK 결정 사항
 
 DECISIONS = {
     "doc_kind": {"label": "자료 종류(가치 이동 방향)", "event_kind": "intake"},
@@ -121,10 +180,14 @@ def matching_versions(conn, *, company_id: int, event_kind: str, decision: str, 
     return out
 
 
-def decide(conn, *, event, decision: str, facts: dict):
-    """('rule', action, version, basis) | ('conflict', [versions], None, reason) | ('none', None, None, None)"""
+def decide(conn, *, event, decision: str, facts: dict, raw: str | None = None):
+    """규칙 적용의 단일 절차(문답·기존 접수 공통).
+    ('rule', action, version, basis) | ('conflict', [versions], None, reason) | ('none', None, None, None)
+    raw 를 주면 doc_kind 규칙의 동작이 원문 표지와 다른 방향일 때 그 규칙은 적용하지 않는다."""
     found = matching_versions(conn, company_id=event["company_id"], event_kind=DECISIONS[decision]["event_kind"],
-                              decision=decision, facts=facts, on_date=event["trade_date"])
+                              decision=decision, facts=facts, on_date=event["trade_date"] if "trade_date" in event.keys() else None)
+    if decision == "doc_kind" and raw is not None:
+        found = [(v, b) for v, b in found if not marker_conflicts(raw, json.loads(v["action"]).get("value"))]
     if not found:
         return "none", None, None, None
     actions = {_j(json.loads(v["action"])) for v, _ in found}
@@ -183,7 +246,7 @@ def candidates(conn, company_id=1) -> list[dict]:
         if f"{kind}|{key}" in linked or len(rows) < CANDIDATE_AFTER:
             continue
         if matching_versions(conn, company_id=company_id, event_kind=DECISIONS[kind]["event_kind"], decision=kind,
-                             facts=_facts_from_key(kind, key), on_date=None):
+                             facts=facts_from_key(kind, key), on_date=None):
             continue
         out.append({"decision": kind, "key": key, "label": rows[-1]["label"], "cases": [r["id"] for r in rows],
                     "answers": [{"answer": json.loads(a), "count": n} for a, n in answers.most_common()],
@@ -191,13 +254,6 @@ def candidates(conn, company_id=1) -> list[dict]:
     return out
 
 
-def _facts_from_key(kind, key):
-    if kind == "doc_kind":
-        return {"form_key": key}
-    if kind == "item_map":
-        sup, _, item = key.partition("|")
-        return {"supplier": sup, "item_text": item}
-    return {}
 
 
 # --------------------------------------------------------------------------- LAG
@@ -356,9 +412,10 @@ def _draft_from_lag(conn, lag, actor, scope, action, reason):
         action = _action_from_answer(kind, json.loads(answers.pop()))
     action = validate_action(conn, kind, action)
     scope = validate_scope(scope)
+    require_specific(kind, facts_from_key(kind, key))
     rule = conn.execute("SELECT * FROM rule WHERE decision=? AND company_id=? AND id IN"
                         " (SELECT rule_id FROM rule_version WHERE condition=?)",
-                        (kind, lag["company_id"], _j(_facts_from_key(kind, key)))).fetchone()
+                        (kind, lag["company_id"], _j(facts_from_key(kind, key)))).fetchone()
     if rule is None:
         n = conn.execute("SELECT COUNT(*) FROM rule WHERE id LIKE 'R-L%'").fetchone()[0] + 1
         rid = f"R-L{n:03d}"
@@ -367,7 +424,7 @@ def _draft_from_lag(conn, lag, actor, scope, action, reason):
                       actor, _now()))
     else:
         rid = rule["id"]
-    return create_version(conn, rule_id=rid, actor=actor, condition=_facts_from_key(kind, key), action=action,
+    return create_version(conn, rule_id=rid, actor=actor, condition=facts_from_key(kind, key), action=action,
                           scope=scope, basis=f"LAG#{lag['id']} 판정({reason or '규칙 반영'}) · {_evidence(conn, lag['id'])}",
                           description=f"{ctx.get('label') or lag['question']} → {_answer_text(kind, action)}",
                           lag_id=lag["id"])
@@ -533,11 +590,12 @@ def directive_rule(conn, *, actor, company_id, decision, condition, action, titl
     if u["role"] == "system":
         raise Forbidden("시스템은 규칙을 만들 수 없습니다")
     action = validate_action(conn, decision, action)
+    require_specific(decision, condition)
     t = _now()
     lid = conn.execute("INSERT INTO lag(company_id, question, context, status, outcome, origin, created_by, created_at,"
                        " updated_at) VALUES (?,?,?, 'closed', 'rule', ?, ?, ?, ?)",
                        (company_id, f"{title} — 사용자 지시로 일반화",
-                        _j({"decision": decision, "condition": condition, "answer_id": answer_id}),
+                        _j({"decision": decision, "key": case_key(condition), "condition": condition, "answer_id": answer_id}),
                         f"dialog answer#{answer_id}", actor, t, t)).lastrowid
     conn.execute("INSERT INTO lag_log(lag_id, from_status, to_status, note, actor, at) VALUES (?,NULL,'closed',?,?,?)",
                  (lid, f"사용자 명시 지시: {instruction}", actor, t))
