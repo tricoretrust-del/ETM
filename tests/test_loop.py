@@ -6,6 +6,7 @@ import json
 
 from etm import db, dialog, learn, plan, process
 from etm.process import Tx
+from etm.learn import Conflict
 from tests.test_dev004 import Base, line, resp
 
 NO_MARK = "LOGISALL 전표 A{n}\n유형: P10\n수량: {q}"     # 원문에 종류 표지 없음 → 종류는 사람이 판단
@@ -201,3 +202,51 @@ class CounterpartyEvidence(Base):
         d = dialog.analyze_input(self.c, text="입고전표\n유형: P10\n수량: 5", actor="owner")
         q = d["open_question"]
         self.assertEqual((q["target"], q["proposed"]), ("counterparty", "로지스올"))
+
+
+class ReturnByText(Base):
+    def test_return_answered_in_words_is_pending_not_kept(self):
+        """'반납이야'처럼 말로 답하고 모델이 동작을 '보관만'으로 내도, 종류 해석이 반납이면 장부 반영 미결."""
+        self.queue = [resp(status="needs_user", action="none", kind_source="none", hyp="unknown",
+                           question={"question_id": "q1", "target": "kind", "reason": "unknown_meaning",
+                                     "text": "무엇인가요?", "options": [], "proposed": None}, lines=[line(qty=20)]),
+                      resp(action="keep_only", kind_source="model_inference", hyp="return", lines=[line(qty=20)])]
+        d = dialog.analyze_input(self.c, text="반납전표\nLOGISALL\n유형: P10\n수량: 20", actor="owner")
+        d = self.answer(d, text="반납이야")
+        self.assertEqual(d["status"], "pending_ledger")
+
+
+class Concurrency(Base):
+    """④ API 응답을 기다리는 동안 다른 요청(조회)이 막히지 않고, 같은 문답의 중복 호출은 거부된다."""
+
+    def test_api_wait_does_not_block_and_inflight_rejected(self):
+        import threading
+        import time
+        from etm import llm as llm_
+        from etm.server import App
+        from tests.test_dev004 import J01
+        app = App.__new__(App)
+        app.conn, app.lock = self.c, dialog.LOCK
+        started, release = threading.Event(), threading.Event()
+
+        def slow(messages):
+            started.set()
+            release.wait(5)
+            return resp()
+        llm_.FIXTURE_RESPONDER = slow
+        out = {}
+        t = threading.Thread(target=lambda: out.setdefault("r", app.handle("POST", "/api/dialogs", {"text": J01})))
+        t.start()
+        self.assertTrue(started.wait(5))
+        t0 = time.time()
+        st, summ = app.handle("GET", "/api/summary", None)      # API 대기 중 다른 요청
+        self.assertEqual(st, 200)
+        self.assertLess(time.time() - t0, 1.0)
+        did = dialog.list_dialogs(self.c)[0]["id"]
+        with self.assertRaises(Conflict):                         # 같은 문답 중복 호출
+            dialog.retry(self.c, dialog_id=did, actor="owner")
+        release.set()
+        t.join(5)
+        self.assertEqual(out["r"][1]["open_question"]["target"], "lines.0.item")
+        n = self.c.execute("SELECT COUNT(*) FROM llm_call WHERE dialog_id=?", (did,)).fetchone()[0]
+        self.assertEqual(n, 1)

@@ -39,6 +39,7 @@ OBLIGATION_LABEL = {
     "freight_pay": "운반비 지급",
     "pallet_return": "팔레트 회수",
     "stock_in": "입고 반영",
+    "ledger_pending": "장부 반영 미결",
 }
 
 

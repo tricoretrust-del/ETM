@@ -172,7 +172,9 @@ class Counterexamples(Base):
         self.assertEqual(d["open_question"]["target"], "kind")
         self.assertIn("반납", d["open_question"]["options"])
         d = self.answer(d, choice="반납")
-        self.assertEqual(d["status"], "kept")
+        self.assertEqual(d["status"], "pending_ledger", "반납은 완료가 아니라 장부 반영 미결")
+        rem = process.remaining(self.c, d["event_id"])
+        self.assertEqual([r["kind"] for r in rem], ["ledger_pending"])
         self.assertEqual(self.factory_kpp(), before, "반납은 처리 엔진이 없으므로 재고 변화 없음(보관만)")
 
     def test_api_interpretation_conflicting_with_marker_reasks(self):

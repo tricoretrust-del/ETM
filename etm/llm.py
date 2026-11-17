@@ -162,7 +162,7 @@ def validate_shape(obj) -> list[str]:
     return errs
 
 
-def call(conn, *, dialog_id, revision, messages, evidence) -> dict:
+def call(conn, *, dialog_id, revision, messages, evidence, lock=None) -> dict:
     """API 호출 1회(+형식 오류 시 재시도). 호출 이력을 남기고 검증된 응답 dict 를 돌려준다.
     DB 쓰기 트랜잭션 밖에서 부른다(장시간 잠금 방지)."""
     from .process import now
@@ -204,13 +204,20 @@ def call(conn, *, dialog_id, revision, messages, evidence) -> dict:
         except LLMError as e:
             status, err = "error", str(e)
         latency = int((time.time() - t0) * 1000)
-        conn.execute("INSERT INTO llm_call(request_id, dialog_id, dialog_revision, provider, model, prompt_version,"
-                     " schema_version, evidence, request, response, status, error, latency_ms, usage, attempt, created_at)"
-                     " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                     (rid, dialog_id, revision, cfg["provider"], cfg["model"], PROMPT_VERSION, SCHEMA_VERSION,
-                      json.dumps(evidence, ensure_ascii=False), json.dumps({"messages": messages}, ensure_ascii=False),
-                      resp_text, status, err, latency, json.dumps(usage) if usage else None, attempt, now()))
+        import contextlib
+        with (lock or contextlib.nullcontext()):   # HTTP 대기는 잠금 밖, 기록만 잠금 안
+            _log_call(conn, rid, dialog_id, revision, cfg, evidence, messages, resp_text, status, err, latency, usage,
+                      attempt, now())
         if status == "ok":
             return {"request_id": rid, "response": parsed}
         last_err = err
     raise LLMError(last_err or "API 호출 실패")
+
+
+def _log_call(conn, rid, dialog_id, revision, cfg, evidence, messages, resp_text, status, err, latency, usage, attempt, at):
+    conn.execute("INSERT INTO llm_call(request_id, dialog_id, dialog_revision, provider, model, prompt_version,"
+                 " schema_version, evidence, request, response, status, error, latency_ms, usage, attempt, created_at)"
+                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                 (rid, dialog_id, revision, cfg["provider"], cfg["model"], PROMPT_VERSION, SCHEMA_VERSION,
+                  json.dumps(evidence, ensure_ascii=False), json.dumps({"messages": messages}, ensure_ascii=False),
+                  resp_text, status, err, latency, json.dumps(usage) if usage else None, attempt, at))

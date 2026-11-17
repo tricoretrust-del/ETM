@@ -17,7 +17,7 @@ STATIC = Path(__file__).parent / "static"
 class App:
     def __init__(self, db_path: str):
         self.conn = db.connect(db_path)
-        self.lock = threading.Lock()  # SQLite 단일 연결 직렬화
+        self.lock = dialog.LOCK  # SQLite 단일 연결 직렬화(문답 모듈과 같은 잠금 — API 대기 중에는 풀린다)
 
     def learning_command(self, cmd: str, b: dict, actor: str):
         c = self.conn
@@ -71,8 +71,29 @@ class App:
             result = learn.idempotent(c, b.get("request_id"), f"plan.{cmd}", fns[cmd])
         return {"result": result, **learn.overview(c)}
 
+    def dialog_api_route(self, method, path, body, actor):
+        """문답 시작·답변·다시 해석. DB 작업만 잠그고 API 응답 대기 중에는 다른 요청을 막지 않는다."""
+        c = self.conn
+        if method != "POST":
+            return None
+        if path == "/api/dialogs":
+            return 200, dialog.analyze_input(c, text=(body or {}).get("text", ""), actor=actor)
+        m = re.fullmatch(r"/api/dialogs/(\d+)/answer", path)
+        if m:
+            b = body or {}
+            return 200, dialog.answer_question(c, dialog_id=int(m[1]), question_id=int(b["question_id"]),
+                                               text=b.get("text"), choice=b.get("choice"), actor=actor,
+                                               expected_revision=b.get("revision"))
+        m = re.fullmatch(r"/api/dialogs/(\d+)/retry", path)
+        if m:
+            return 200, dialog.retry(c, dialog_id=int(m[1]), actor=actor)
+        return None
+
     def handle(self, method: str, path: str, body: dict | None, actor: str = "owner"):
         process.ACTOR.set(actor)
+        api = self.dialog_api_route(method, path, body, actor)   # 외부 API 를 부르는 요청: 잠금을 스스로 관리
+        if api is not None:
+            return api
         with self.lock:
             c = self.conn
             if method == "GET" and path == "/api/history":
@@ -102,25 +123,14 @@ class App:
             m = re.fullmatch(r"/api/events/(\d+)", path)
             if method == "GET" and m:
                 return 200, process.event_detail(c, int(m[1]))
-            # ---- DEV-004 v0.2 문답 (API 호출은 수 초 걸린다. 단일 사용자 전제로 잠금 안에서 처리)
+            # ---- DEV-004 v0.2 문답 조회·후보 (API 를 부르는 요청은 dialog_api_route)
             if method == "GET" and path == "/api/dialogs":
                 cfg = llm.config()
                 return 200, {"dialogs": dialog.list_dialogs(c), "provider": cfg["provider"], "model": cfg["model"],
                              "metrics": dialog.metrics(c)}
-            if method == "POST" and path == "/api/dialogs":
-                return 200, dialog.analyze_input(c, text=(body or {}).get("text", ""), actor=actor)
             m = re.fullmatch(r"/api/dialogs/(\d+)", path)
             if method == "GET" and m:
                 return 200, dialog.detail(c, int(m[1]))
-            m = re.fullmatch(r"/api/dialogs/(\d+)/answer", path)
-            if method == "POST" and m:
-                b = body or {}
-                return 200, dialog.answer_question(c, dialog_id=int(m[1]), question_id=int(b["question_id"]),
-                                                   text=b.get("text"), choice=b.get("choice"), actor=actor,
-                                                   expected_revision=b.get("revision"))
-            m = re.fullmatch(r"/api/dialogs/(\d+)/retry", path)
-            if method == "POST" and m:
-                return 200, dialog.retry(c, dialog_id=int(m[1]), actor=actor)
             m = re.fullmatch(r"/api/candidates/(\d+)/(accept|dismiss)", path)
             if method == "POST" and m:
                 if m[2] == "accept":

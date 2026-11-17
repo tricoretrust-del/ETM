@@ -26,6 +26,9 @@ def main():
 
     if args.cmd == "demo":
         if args.reset:
+            if Path(DEMO_DB).resolve() == Path(db.DEFAULT_DB).resolve():
+                raise SystemExit("시험 DB 경로가 운영 DB 와 같아 초기화하지 않습니다")
+            print(f"시험 DB 초기화: {DEMO_DB} (운영 DB {db.DEFAULT_DB} 는 건드리지 않음)")
             for suffix in ("", "-wal", "-shm"):
                 if os.path.exists(DEMO_DB + suffix):
                     os.remove(DEMO_DB + suffix)

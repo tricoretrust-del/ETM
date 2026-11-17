@@ -17,7 +17,24 @@ git clone https://github.com/tricoretrust-del/ETM.git
 cd ETM
 ```
 
-가상 시험 데이터로 실행합니다(`data/etm_demo.db`, `--reset`을 주면 새로 만듭니다).
+### 자료 해석(문답) 설정
+
+`OPENAI_API_KEY` 환경변수가 있으면 붙여넣은 자료를 API 로 해석해 필요한 것만 묻습니다. 키는 코드·저장소·브라우저에 넣지 않습니다.
+없으면 문답 경로는 꺼지고 기존 접수(JSON·메모 자동 변환)만 동작합니다.
+- `ETM_LLM_PROVIDER` = `openai` | `fixture`(시험) | `off`
+- `ETM_OPENAI_MODEL` 모델 변경(기본값은 `etm/llm.py`의 `DEFAULT_MODEL`)
+
+### 시험 절차 (가상 데이터 · 시험 DB 전용)
+
+시험 DB `data/etm_demo.db` 만 씁니다. 운영 DB `data/etm.db` 는 건드리지 않습니다.
+
+이어서 시험합니다(시험 DB 의 기존 기록 유지).
+
+```bash
+python3 -m etm demo
+```
+
+시험 DB 를 지우고 가상 데이터로 새로 시작합니다. **시험 DB 의 모든 기록(문답·학습 규칙 포함)이 삭제됩니다.** 운영 DB 와는 무관합니다.
 
 ```bash
 python3 -m etm demo --reset
@@ -26,7 +43,9 @@ python3 -m etm demo --reset
 브라우저에서 http://127.0.0.1:8000 을 엽니다. "확인 필요한 송장" 예제를 누르고 **접수**를 누르면 확인 흐름을 볼 수 있습니다.
 입력 칸에는 JSON 이 아니어도 됩니다. `송장번호: …`, `품목: 보도블록A 600 EA` 같은 메모·메시지를 그대로 붙여넣으면 자동으로 변환합니다.
 
-운영 DB로 실행합니다(`data/etm.db`, 시험 데이터 없음).
+### 운영 실행
+
+운영 DB로 실행합니다(`data/etm.db`, 시험 데이터 없음, 초기화 옵션 없음). 실제 자료는 이것으로만 처리합니다.
 
 ```bash
 python3 -m etm serve

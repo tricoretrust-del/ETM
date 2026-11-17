@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 
 from . import contract, learn, llm, process, textparse
 from .learn import Conflict, Forbidden
@@ -31,6 +32,10 @@ KIND_WORDS = {"shipment": ("출하", "송장"), "receipt": ("입고",), "return"
 YES = re.compile(r"^\s*(맞(음|아|아요|습니다)?|네|예|응|ㅇㅇ|ok|yes|그래|그렇다|맞다)\s*[.!]?\s*$", re.I)
 YES_PREFIX = re.compile(r"^\s*(맞(음|아|아요|습니다)?|네|예|응|그래|맞다)\s*[.,!]\s*\S", re.I)
 NO_EFFECT_ITEM = "none"
+# 단일 SQLite 연결을 여러 요청 스레드가 함께 쓰므로 DB 작업은 이 잠금 안에서만 한다(서버도 같은 잠금을 쓴다).
+# API 응답을 기다리는 동안에는 잠금을 잡지 않는다.
+LOCK = threading.RLock()
+INFLIGHT: set[int] = set()   # API 호출이 진행 중인 문답
 doc_marker = learn.doc_marker
 _marker_conflicts = learn.marker_conflicts
 
@@ -136,23 +141,24 @@ def _messages(conn, d, ctx) -> list[dict]:
 # --------------------------------------------------------------------------- 공개 명령
 def analyze_input(conn, *, text: str, actor: str, company_id: int = 1) -> dict:
     """새 자료로 문답 시작 → API 해석 1회."""
-    learn.user(conn, actor)
-    if not (text or "").strip():
-        raise ValueError("입력 내용이 비어 있습니다")
-    same = conn.execute("SELECT id FROM dialog WHERE company_id=? AND raw_input=? AND status IN ('asking','failed')"
-                        " ORDER BY id DESC LIMIT 1", (company_id, text)).fetchone()
-    if same:   # 같은 자료를 다시 보냄(중복 클릭·재접속) → 진행 중인 문답으로 이어 간다. API 재호출 없음
-        return detail(conn, same["id"])
-    try:
-        ext, _ = textparse.to_payload(text, process.customer_names(conn))
-    except ValueError:
-        ext = {}
-    with Tx(conn):
-        t = now()
-        did = conn.execute("INSERT INTO dialog(company_id, status, raw_input, extracted, state, created_by, created_at,"
-                           " updated_at) VALUES (?, 'asking', ?, ?, '{}', ?, ?, ?)",
-                           (company_id, text, jdump({k: v for k, v in ext.items() if k != "raw_text"}), actor, t, t)).lastrowid
-        process.log(conn, None, "dialog", f"문답 #{did} 시작 · {text.strip().splitlines()[0][:40]}")
+    with LOCK:
+        learn.user(conn, actor)
+        if not (text or "").strip():
+            raise ValueError("입력 내용이 비어 있습니다")
+        same = conn.execute("SELECT id FROM dialog WHERE company_id=? AND raw_input=? AND status IN ('asking','failed')"
+                            " ORDER BY id DESC LIMIT 1", (company_id, text)).fetchone()
+        if same:   # 같은 자료를 다시 보냄(중복 클릭·재접속) → 진행 중인 문답으로 이어 간다. API 재호출 없음
+            return detail(conn, same["id"])
+        try:
+            ext, _ = textparse.to_payload(text, process.customer_names(conn))
+        except ValueError:
+            ext = {}
+        with Tx(conn):
+            t = now()
+            did = conn.execute("INSERT INTO dialog(company_id, status, raw_input, extracted, state, created_by, created_at,"
+                               " updated_at) VALUES (?, 'asking', ?, ?, '{}', ?, ?, ?)",
+                               (company_id, text, jdump({k: v for k, v in ext.items() if k != "raw_text"}), actor, t, t)).lastrowid
+            process.log(conn, None, "dialog", f"문답 #{did} 시작 · {text.strip().splitlines()[0][:40]}")
     return run_turn(conn, did)
 
 
@@ -160,83 +166,102 @@ def answer_question(conn, *, dialog_id: int, question_id: int, text: str | None 
                     actor: str, expected_revision: int | None = None) -> dict:
     """사용자 답변을 먼저 저장하고 서버 상태에 반영한다. 서버가 결정적으로 처리할 수 있으면 API 없이 진행,
     아니면 재호출."""
-    learn.user(conn, actor)
-    raw = (text if text is not None else choice) or ""
-    if not raw.strip():
-        raise ValueError("답변이 비어 있습니다")
-    need_api = True
-    with Tx(conn):
-        d = _dialog(conn, dialog_id)
-        if expected_revision is not None and int(expected_revision) != d["revision"]:
-            raise Conflict("문답이 그사이 바뀌었습니다. 새로 불러와 다시 답하세요")
-        q = conn.execute("SELECT * FROM dialog_question WHERE id=? AND dialog_id=?", (question_id, dialog_id)).fetchone()
-        if not q or q["status"] != "open":
-            raise Conflict("이미 답했거나 없는 질문입니다")
-        aid = conn.execute("INSERT INTO dialog_answer(dialog_id, question_id, raw_text, actor, at) VALUES (?,?,?,?,?)",
-                           (dialog_id, question_id, raw, actor, now())).lastrowid
-        conn.execute("UPDATE dialog_question SET status='answered' WHERE id=?", (question_id,))
-        _bump(conn, dialog_id)
-        state = _state(d)
-        # 서버가 만든 확인 질문: 선택·'맞음'은 그 질문이 제시한 값에만 적용(대상 없는 승인은 만들지 않음)
-        resolved = _resolve_server_answer(conn, q, choice, text, state, aid)
-        if resolved:
-            _set_state(conn, dialog_id, state)
-            # 긍정 뒤에 말이 더 있으면(예: '맞아. 다음에도 …') 일반화 지시일 수 있으므로 API 로 해석도 받는다
-            need_api = bool(text and YES_PREFIX.match(text))
-    if not need_api:
-        return _continue_after_server_answer(conn, dialog_id)
+    with LOCK:
+        learn.user(conn, actor)
+        raw = (text if text is not None else choice) or ""
+        if not raw.strip():
+            raise ValueError("답변이 비어 있습니다")
+        need_api = True
+        with Tx(conn):
+            d = _dialog(conn, dialog_id)
+            if expected_revision is not None and int(expected_revision) != d["revision"]:
+                raise Conflict("문답이 그사이 바뀌었습니다. 새로 불러와 다시 답하세요")
+            q = conn.execute("SELECT * FROM dialog_question WHERE id=? AND dialog_id=?", (question_id, dialog_id)).fetchone()
+            if not q or q["status"] != "open":
+                raise Conflict("이미 답했거나 없는 질문입니다")
+            aid = conn.execute("INSERT INTO dialog_answer(dialog_id, question_id, raw_text, actor, at) VALUES (?,?,?,?,?)",
+                               (dialog_id, question_id, raw, actor, now())).lastrowid
+            conn.execute("UPDATE dialog_question SET status='answered' WHERE id=?", (question_id,))
+            _bump(conn, dialog_id)
+            state = _state(d)
+            # 서버가 만든 확인 질문: 선택·'맞음'은 그 질문이 제시한 값에만 적용(대상 없는 승인은 만들지 않음)
+            resolved = _resolve_server_answer(conn, q, choice, text, state, aid)
+            if resolved:
+                _set_state(conn, dialog_id, state)
+                # 긍정 뒤에 말이 더 있으면(예: '맞아. 다음에도 …') 일반화 지시일 수 있으므로 API 로 해석도 받는다
+                need_api = bool(text and YES_PREFIX.match(text))
+        if not need_api:
+            return _continue_after_server_answer(conn, dialog_id)
     return run_turn(conn, dialog_id)
 
 
 def retry(conn, *, dialog_id: int, actor: str) -> dict:
-    learn.user(conn, actor)
-    d = _dialog(conn, dialog_id)
-    if d["status"] not in ("failed", "asking"):
-        raise Conflict("다시 해석할 수 있는 상태가 아닙니다")
+    with LOCK:
+        learn.user(conn, actor)
+        d = _dialog(conn, dialog_id)
+        if d["status"] not in ("failed", "asking"):
+            raise Conflict("다시 해석할 수 있는 상태가 아닙니다")
     return run_turn(conn, dialog_id)
 
 
 # --------------------------------------------------------------------------- API 턴
 def run_turn(conn, did) -> dict:
-    d = _dialog(conn, did)
-    n_calls = conn.execute("SELECT COUNT(*) FROM llm_call WHERE dialog_id=?", (did,)).fetchone()[0]
-    if n_calls >= llm.MAX_CALLS_PER_DIALOG:
-        with Tx(conn):
-            conn.execute("UPDATE dialog SET status='failed', status_reason=?, updated_at=? WHERE id=?",
-                         (f"API 호출 한도({llm.MAX_CALLS_PER_DIALOG}회) 도달 — 반영 보류", now(), did))
-        return detail(conn, did)
-    rev = d["revision"]
-    ctx, evidence = _context(conn, d)
-    messages = _messages(conn, d, ctx)
-    for attempt in (1, 2):
-        try:
-            out = llm.call(conn, dialog_id=did, revision=rev, messages=messages, evidence=evidence)
-        except llm.LLMError as e:
-            with Tx(conn):
-                conn.execute("UPDATE dialog SET status='failed', status_reason=?, updated_at=? WHERE id=?",
-                             (f"API 실패 — 반영 보류, 원문·답변 보존: {e}", now(), did))
-            return detail(conn, did)
-        bad = [r for r in _all_refs(out["response"]) if not _ref_ok(conn, r, d["company_id"])]
-        if not bad:
-            break
-        conn.execute("UPDATE llm_call SET status='invalid', error=? WHERE request_id=?",
-                     (f"없거나 다른 회사의 근거 ID: {', '.join(bad[:5])}", out["request_id"]))
-        if attempt == 2 or conn.execute("SELECT COUNT(*) FROM llm_call WHERE dialog_id=?",
-                                        (did,)).fetchone()[0] >= llm.MAX_CALLS_PER_DIALOG:
-            with Tx(conn):
-                conn.execute("UPDATE dialog SET status='failed', status_reason=?, updated_at=? WHERE id=?",
-                             (f"API 응답 검증 실패(근거 ID {', '.join(bad[:3])}) — 반영 보류", now(), did))
-            return detail(conn, did)
-        messages = messages + [{"role": "assistant", "content": json.dumps(out["response"], ensure_ascii=False)},
-                               {"role": "user", "content": f"서버 검증 실패: 존재하지 않는 근거 ID {bad}. "
-                                                           "allowed_evidence_refs 에 있는 ID 만 쓰고 다시 답하라."}]
-    with Tx(conn):
+    """API 턴. DB 작업만 잠금(LOCK) 안에서 하고, API 를 기다리는 동안에는 잠금을 풀어 다른 요청을 막지 않는다.
+    같은 문답에 대한 API 호출이 이미 진행 중이면 거부한다(외부 호출 중복 방지). 늦게 온 응답은 리비전으로 버린다."""
+    with LOCK:
+        if did in INFLIGHT:
+            raise Conflict("이 자료를 해석하는 중입니다. 잠시 후 다시 확인하세요")
         d = _dialog(conn, did)
-        if d["revision"] != rev:   # 새 답변으로 상태가 바뀐 뒤 늦게 온 응답은 버린다
-            conn.execute("UPDATE llm_call SET status='stale' WHERE request_id=?", (out["request_id"],))
+        n_calls = conn.execute("SELECT COUNT(*) FROM llm_call WHERE dialog_id=?", (did,)).fetchone()[0]
+        if n_calls >= llm.MAX_CALLS_PER_DIALOG:
+            with Tx(conn):
+                conn.execute("UPDATE dialog SET status='failed', status_reason=?, updated_at=? WHERE id=?",
+                             (f"API 호출 한도({llm.MAX_CALLS_PER_DIALOG}회) 도달 — 반영 보류", now(), did))
             return detail(conn, did)
-        _process_response(conn, d, out["response"], out["request_id"])
-    return detail(conn, did)
+        rev = d["revision"]
+        ctx, evidence = _context(conn, d)
+        messages = _messages(conn, d, ctx)
+        INFLIGHT.add(did)
+    try:
+        for attempt in (1, 2):
+            try:
+                out = llm.call(conn, dialog_id=did, revision=rev, messages=messages, evidence=evidence, lock=LOCK)
+            except llm.LLMError as e:
+                with LOCK, Tx(conn):
+                    conn.execute("UPDATE dialog SET status='failed', status_reason=?, updated_at=? WHERE id=?",
+                                 (f"API 실패 — 반영 보류, 원문·답변 보존: {e}", now(), did))
+                return detail_locked(conn, did)
+            with LOCK:
+                bad = [r for r in _all_refs(out["response"]) if not _ref_ok(conn, r, d["company_id"])]
+                if not bad:
+                    break
+                conn.execute("UPDATE llm_call SET status='invalid', error=? WHERE request_id=?",
+                             (f"없거나 다른 회사의 근거 ID: {', '.join(bad[:5])}", out["request_id"]))
+                if attempt == 2 or conn.execute("SELECT COUNT(*) FROM llm_call WHERE dialog_id=?",
+                                                (did,)).fetchone()[0] >= llm.MAX_CALLS_PER_DIALOG:
+                    with Tx(conn):
+                        conn.execute("UPDATE dialog SET status='failed', status_reason=?, updated_at=? WHERE id=?",
+                                     (f"API 응답 검증 실패(근거 ID {', '.join(bad[:3])}) — 반영 보류", now(), did))
+                    return detail(conn, did)
+            messages = messages + [{"role": "assistant", "content": json.dumps(out["response"], ensure_ascii=False)},
+                                   {"role": "user", "content": f"서버 검증 실패: 존재하지 않는 근거 ID {bad}. "
+                                                               "allowed_evidence_refs 에 있는 ID 만 쓰고 다시 답하라."}]
+        with LOCK:
+            with Tx(conn):
+                d = _dialog(conn, did)
+                if d["revision"] != rev:   # 새 답변으로 상태가 바뀐 뒤 늦게 온 응답은 버린다
+                    conn.execute("UPDATE llm_call SET status='stale' WHERE request_id=?", (out["request_id"],))
+                else:
+                    _process_response(conn, d, out["response"], out["request_id"])
+            return detail(conn, did)
+    finally:
+        with LOCK:
+            INFLIGHT.discard(did)
+
+
+def detail_locked(conn, did) -> dict:
+    with LOCK:
+        return detail(conn, did)
 
 
 def _ref_ok(conn, ref: str, company: int) -> bool:
@@ -292,12 +317,13 @@ def _process_response(conn, d, resp, request_id):
     # 사용자 답으로 종류가 확정된 경우(API 해석) — 원문 답변이 있어야만 인정
     kind = ACTION_TO_KIND.get(pp["action"])
     hk = (resp.get("document_hypothesis") or {}).get("kind")
-    if pp["kind_source"] == "user_answer" and hk in KIND_TO_DOC and hk != kind:
-        # 사용자 답의 해석(가설)과 처리 동작이 어긋나면 가설을 따른다. 반납은 처리 엔진이 없으므로 보관만.
-        kind = hk
-        pp = dict(pp, action={"shipment": "shipment_apply", "receipt": "receipt_record"}.get(hk, "keep_only"))
     kind_q = last_a is not None and conn.execute("SELECT 1 FROM dialog_question WHERE id=? AND target='kind'",
                                                  (last_a["question_id"],)).fetchone()
+    if (pp["kind_source"] == "user_answer" or kind_q) and hk in KIND_TO_DOC and hk != kind:
+        # 사용자 답의 해석(가설)과 처리 동작이 어긋나면 가설을 따른다(예: 반납인데 동작은 '보관만').
+        # 반납은 처리 기준이 없어 동작은 보관이지만 종류는 '반납'으로 남겨 장부 반영 미결로 표시한다.
+        kind = hk
+        pp = dict(pp, action={"shipment": "shipment_apply", "receipt": "receipt_record"}.get(hk, "keep_only"))
     if kind and (pp["kind_source"] == "user_answer" or kind_q) and last_a is not None and "kind" not in state:
         # 방금 '종류' 질문에 사용자가 답했고 그 해석으로 처리안이 나왔으면 사용자 답으로 본다(같은 질문 반복 방지)
         state["kind"] = {"value": kind, "source": "user_answer", "answer_id": last_a["id"], "via": "api_interpretation"}
@@ -732,8 +758,16 @@ def _apply(conn, did, pid, pp, state):
     conn.execute("UPDATE dialog_proposal SET status='applied', event_id=?, validation=? WHERE id=?",
                  (ev, jdump({"payload": p, "outcome": res["outcome"],
                              "confirmations": state.get("confirmations") or {}}), pid))
-    conn.execute("UPDATE dialog SET status=?, event_id=?, updated_at=? WHERE id=?",
-                 ("kept" if doc_type == "other" else "applied", ev, now(), did))
+    status = "applied"
+    if kind == "return":
+        # 반납·회수: 처리 기준(누구 소유가 어디로)이 정해지지 않아 장부는 바꾸지 않는다. 완료로 보이지 않게 미결로 남긴다
+        status = "pending_ledger"
+        items = ", ".join(f"{ln['item_text']} {_fmt(ln.get('qty')) or '?'}" for ln in pp.get("lines") or [])
+        conn.execute("INSERT INTO obligation(event_id, kind, state, note, updated_at) VALUES (?, 'ledger_pending', 'open', ?, ?)",
+                     (ev, f"반납 · {pp.get('counterparty') or '상대 미상'} · {items} — 반납 처리 기준 미정, 장부 미반영", now()))
+    elif doc_type == "other":
+        status = "kept"
+    conn.execute("UPDATE dialog SET status=?, event_id=?, updated_at=? WHERE id=?", (status, ev, now(), did))
     # 학습 기록: 확정 사례 (사건의 사실. 자동 일반 규칙 아님)
     sup = norm(pp.get("counterparty") or "")
     k = state["kind"]
