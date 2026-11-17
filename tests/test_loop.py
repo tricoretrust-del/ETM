@@ -309,3 +309,22 @@ class DocumentMarkerByServer(Base):
         self.queue = [resp(action="shipment_apply", kind_source="model_inference", hyp="shipment", lines=[line(qty=5)])]
         d = dialog.analyze_input(self.c, text="LOGISALL 입고전표\n유형: P10\n수량: 5", actor="owner")
         self.assertEqual(d["open_question"]["target"], "kind")
+
+
+class InterpretationGuard(Base):
+    A = "P10은 KPP 팔레트의 모델명이고 이 전표는 LOGISALL이 지오블록의 하차담당자에게 전달한 거야"
+
+    def test_item_from_sentence_without_reask_and_wrong_owner_not_recorded(self):
+        """실제 API 에서 관찰: 문장 답을 모델이 '소유자=자사'로 읽음 → 기준정보(KPP 소유)와 모순 → 기록하지 않고 확인."""
+        from tests.test_dev004 import J01
+        self.queue = [resp(), resp(lines=[line(owner="own", osrc="user_answer")])]
+        d = dialog.analyze_input(self.c, text=J01, actor="owner")
+        d = self.answer(d, text=self.A)                      # 품목 질문에 문장으로 답함
+        self.assertEqual(d["state"]["items"]["0"]["via"], "text_match")
+        q = d["open_question"]
+        self.assertEqual((q["target"], q["reason"]), ("lines.0.owner", "conflict"))
+        self.assertIsNone(d["event_id"], "모순된 소유자가 장부에 들어가면 안 됨")
+        d = self.answer(d, choice="KPP")
+        mv = self.c.execute("SELECT owner FROM value_move WHERE event_id=?", (d["event_id"],)).fetchone()
+        kpp = self.c.execute("SELECT id FROM party WHERE name='KPP'").fetchone()[0]
+        self.assertEqual(mv["owner"], f"party:{kpp}")

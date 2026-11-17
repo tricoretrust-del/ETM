@@ -95,7 +95,7 @@ async function refreshSide(){
     `<span>받을 돈 ${won(s.receivable.known)}${s.receivable.undetermined_count?` + 미확정 ${s.receivable.undetermined_count}건`:""}</span>`+
     `<span>줄 돈 ${won(s.payable.known)}${s.payable.undetermined_count?` + 미확정 ${s.payable.undetermined_count}건`:""}</span>`+
     `<span>팔레트 공장 ${palF} · 현장 ${pal}</span>`+
-    `<span><button onclick="showLearning()">RBK·PLN·LAG</button>${todo?` <b style="color:var(--warn)">${todo}</b>`:""}`+
+    `<span><button onclick="showTrend()">학습 추이</button> <button onclick="showLearning()">RBK·PLN·LAG</button>${todo?` <b style="color:var(--warn)">${todo}</b>`:""}`+
     ` <span title="사용자에게 물은 판단 / 규칙이 처리한 판단">물음 ${L.stats.asked} · 자동 ${L.stats.auto}</span></span>`;
   window._summary = s;
   if(!h.days.length){ $("#hist").innerHTML = '<div class="empty">아직 처리한 기록이 없습니다.</div>'; return; }
@@ -134,6 +134,29 @@ function scopeText(r, v){
   for(const [k,val] of Object.entries(s)) parts.push(`${({party_id:"거래처",site_id:"현장",item_id:"품목"})[k]} #${val}`);
   if(Object.keys(c).length) parts.push("조건: " + Object.values(c).join(" / "));
   return parts.join(" · ");
+}
+// ---------------- 학습 추이: DB 의 변경 기록(사례·LAG·PLN·RBK·적용·질문)을 시간순으로
+const LAYER_COLOR = {"질문":"var(--open)","사례":"var(--muted)","LAG":"var(--warn)","PLN":"var(--accent)","RBK":"var(--ok)","적용":"var(--ok)"};
+async function showTrend(){
+  current = null;
+  const t = await api("/api/learning/timeline");
+  const docs = t.docs, W = 22, H = 70, maxQ = Math.max(1, ...docs.map(x=>Math.max(x.questions, x.rule_decisions)));
+  const bars = docs.map((x,i)=>{
+    const hq = x.questions/maxQ*(H-14), ha = x.rule_decisions/maxQ*(H-14), X = 8 + i*W;
+    return `<g><title>문답 #${x.dialog} ${esc(x.head)} — 질문 ${x.questions} · 규칙 처리 ${x.rule_decisions}</title>`+
+      `<rect x="${X}" y="${H-hq}" width="8" height="${hq}" fill="var(--open)"></rect>`+
+      `<rect x="${X+9}" y="${H-ha}" width="8" height="${ha}" fill="var(--ok)"></rect>`+
+      `<text x="${X+8}" y="${H+11}" font-size="9" text-anchor="middle" fill="var(--muted)">${x.dialog}</text></g>`;
+  }).join("");
+  const fmt = o => Object.entries(o).map(([k,v])=>`${k} ${v}`).join(" · ") || "없음";
+  const rows = t.events.slice().reverse().map(e=>`<tr><td><span class="t">${esc((e.at||"").slice(5,16).replace("T"," "))}</span>`+
+    `<br><b style="color:${LAYER_COLOR[e.layer]||"inherit"}">${esc(e.layer)}</b></td><td>${esc(e.text)}`+
+    `<div class="meta">RBK ${fmt(e.state.rbk)} │ LAG ${fmt(e.state.lag)} │ PLN ${fmt(e.state.pln)} │ 누적 질문 ${e.state.asked} · 규칙 처리 ${e.state.auto}</div></td></tr>`).join("");
+  $("#left").innerHTML = `<h2>학습 추이</h2><div class="card">
+    <div class="meta">자료(문답)별 질문 수 <b style="color:var(--open)">■</b> 와 규칙이 처리한 판단 수 <b style="color:var(--ok)">■</b>. 학습이 되면 질문은 줄고 규칙 처리는 늘어야 합니다.</div>
+    <div style="overflow-x:auto"><svg width="${Math.max(200, 16+docs.length*W)}" height="${H+16}">${bars}</svg></div></div>
+    <div class="card"><div class="title">변경 기록 (최근 순)</div><div class="meta">각 줄 아래는 그 시점의 RBK·LAG·PLN 상태입니다.</div>
+    <div style="overflow-x:auto"><table>${rows || "<tr><td>기록 없음</td></tr>"}</table></div></div>`;
 }
 async function showLearning(){
   current = null;

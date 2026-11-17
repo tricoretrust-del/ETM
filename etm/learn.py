@@ -531,12 +531,16 @@ def _answer_text(kind, answer) -> str:
             return contract.DOC_KIND_CHOICES.get(answer["value"], answer["value"])
         if answer["type"] == "map_item":
             return answer.get("label") or answer["choice"]
+        if answer["type"] == "set_owner":
+            return f"소유자 {answer.get('label') or answer['owner']}"
         if answer["type"] == "compare_pallets":
             return "일치하면 확정, 다르면 확인 필수"
     if kind == "doc_kind":
         return contract.DOC_KIND_CHOICES.get(answer, str(answer))
     if kind == "item_map":
         return answer.get("label") if isinstance(answer, dict) else str(answer)
+    if kind == "owner_map" and isinstance(answer, dict):
+        return f"소유자 {answer.get('label') or answer.get('owner')}"
     return str(answer)
 
 
@@ -562,7 +566,8 @@ def overview(conn, company_id=1) -> dict:
             "case_ids": [x[0] for x in conn.execute(
                 "SELECT decision_case_id FROM lag_link WHERE lag_id=? AND decision_case_id IS NOT NULL", (l["id"],))],
         })
-    asked = conn.execute("SELECT COUNT(*) FROM check_item WHERE state='answered'").fetchone()[0]
+    asked = conn.execute("SELECT COUNT(*) FROM check_item WHERE state='answered'").fetchone()[0] \
+        + conn.execute("SELECT COUNT(*) FROM dialog_answer").fetchone()[0]   # 기존 접수 확인 + 문답 답변
     auto = conn.execute("SELECT COUNT(*) FROM rule_application WHERE result='performed'").fetchone()[0]
     pending = sum(1 for r in rules for v in r["versions"] if v["status"] == "pending")
     return {"rules": rules, "lags": lags, "plans": plan_mod.list_plans(conn, company_id),
@@ -629,3 +634,82 @@ def directive_rule(conn, *, actor, company_id, decision, condition, action, titl
         approve_version(conn, version_id=vid, actor=actor, reason="지시한 사용자가 승인권자")
         status = "active"
     return {"lag_id": lid, "rule_id": rid, "rule_version_id": vid, "status": status}
+
+
+# --------------------------------------------------------------------------- 학습 추이 (RBK·PLN·LAG 변화 기록 재구성)
+def timeline(conn, company_id=1) -> dict:
+    """DB 에 남은 변경 기록(사례·lag_log·plan_log·규칙 버전·판정·적용·문답 질문)을 시간순으로 모아
+    각 시점의 RBK·PLN·LAG 상태 수를 다시 계산한다. 새로 저장하는 것은 없다(기록에서 재구성)."""
+    ev = []   # (at, rank, id, layer, kind, text, ref)
+
+    def add(at, rank, rid, layer, kind, text, ref=None):
+        ev.append({"at": at, "rank": rank, "id": rid, "layer": layer, "kind": kind, "text": text, "ref": ref})
+
+    for r in conn.execute("SELECT id, at, label, answer, actor, decision_kind FROM decision_case WHERE company_id=?"
+                          " AND rule_version_id IS NULL AND actor<>'system'", (company_id,)):
+        add(r["at"], 1, r["id"], "사례", "case", f"{r['label']} → {_answer_text(r['decision_kind'], json.loads(r['answer']))}",
+            f"case:{r['id']}")
+    for r in conn.execute("SELECT g.*, l.question FROM lag_log g JOIN lag l ON l.id=g.lag_id WHERE l.company_id=?"
+                          " AND l.layer='ops'", (company_id,)):
+        add(r["at"], 2, r["id"], "LAG", r["to_status"],
+            f"LAG-{r['lag_id']} {r['from_status'] or '신규'} → {r['to_status']} · {r['question'][:50]}", f"lag:{r['lag_id']}")
+    for r in conn.execute("SELECT g.*, p.title FROM plan_log g JOIN plan p ON p.id=g.plan_id WHERE p.company_id=?",
+                          (company_id,)):
+        if r["action"] == "link":
+            continue
+        add(r["at"], 3, r["id"], "PLN", r["to_status"],
+            f"PLN-{r['plan_id']} {r['action']} {r['from_status']} → {r['to_status']} · {r['title'][:50]}", f"plan:{r['plan_id']}")
+    for r in conn.execute("SELECT v.*, r.decision, r.title FROM rule_version v JOIN rule r ON r.id=v.rule_id"
+                          " WHERE r.company_id=? OR r.company_id IS NULL", (company_id,)):
+        add(r["created_at"], 4, r["id"], "RBK", "created",
+            f"{r['rule_id']} v{r['version_no']} 생성(승인 대기) · {r['description'] or r['title']}", f"rv:{r['id']}")
+    for r in conn.execute("SELECT j.*, v.rule_id, v.version_no FROM judgment j JOIN rule_version v ON v.id=j.rule_version_id"
+                          " WHERE j.rule_version_id IS NOT NULL"):
+        add(r["at"], 5, r["id"], "RBK", r["kind"], f"{r['rule_id']} v{r['version_no']} {r['kind']} · {r['reason'] or ''}",
+            f"rv:{r['rule_version_id']}")
+    for r in conn.execute("SELECT a.*, v.rule_id, v.version_no FROM rule_application a JOIN rule_version v"
+                          " ON v.id=a.rule_version_id JOIN event e ON e.id=a.event_id WHERE e.company_id=?", (company_id,)):
+        add(r["at"], 6, r["id"], "적용", r["result"], f"{r['rule_id']} v{r['version_no']} → 사건 #{r['event_id']} {r['target']}",
+            f"event:{r['event_id']}")
+    for r in conn.execute("SELECT q.id, q.created_at, q.text, q.dialog_id FROM dialog_question q JOIN dialog d"
+                          " ON d.id=q.dialog_id WHERE d.company_id=? AND q.status<>'superseded'", (company_id,)):
+        add(r["created_at"], 0, r["id"], "질문", "asked", f"문답 #{r['dialog_id']} · {r['text'][:60]}", f"dialog:{r['dialog_id']}")
+    ev.sort(key=lambda e: (e["at"] or "", e["rank"], e["id"]))
+
+    rv, lg, pl = {}, {}, {}
+    rv_rule = {r["id"]: r["rule_id"] for r in conn.execute("SELECT id, rule_id FROM rule_version")}
+    asked = auto = cases = 0
+    for e in ev:
+        kind, ref = e["kind"], e["ref"] or ""
+        if e["layer"] == "RBK":
+            vid = int(ref.split(":")[1])
+            if kind == "created":
+                rv[vid] = "pending"
+            elif kind in ("approve", "resume"):
+                for o, st in rv.items():
+                    if st == "active" and rv_rule.get(o) == rv_rule.get(vid) and o != vid:
+                        rv[o] = "superseded"
+                rv[vid] = "active"
+            elif kind in ("suspend", "retire"):
+                rv[vid] = "suspended" if kind == "suspend" else "retired"
+        elif e["layer"] == "LAG":
+            lg[ref] = kind
+        elif e["layer"] == "PLN":
+            pl[ref] = kind
+        elif e["layer"] == "질문":
+            asked += 1
+        elif e["layer"] == "적용" and kind == "performed":
+            auto += 1
+        elif e["layer"] == "사례":
+            cases += 1
+        cnt = lambda d: {s: sum(1 for x in d.values() if x == s) for s in sorted(set(d.values()))}
+        e["state"] = {"rbk": cnt(rv), "lag": cnt(lg), "pln": cnt(pl), "asked": asked, "auto": auto, "cases": cases}
+    docs = []
+    for d in conn.execute("SELECT id, status, event_id, raw_input, created_at FROM dialog WHERE company_id=? ORDER BY id",
+                          (company_id,)):
+        q = conn.execute("SELECT COUNT(*) FROM dialog_question WHERE dialog_id=? AND status<>'superseded'", (d["id"],)).fetchone()[0]
+        a = conn.execute("SELECT COUNT(*) FROM rule_application WHERE event_id=? AND result='performed'",
+                         (d["event_id"],)).fetchone()[0] if d["event_id"] else 0
+        docs.append({"dialog": d["id"], "at": d["created_at"], "head": d["raw_input"].strip().splitlines()[0][:40],
+                     "status": d["status"], "questions": q, "rule_decisions": a})
+    return {"events": ev, "docs": docs}

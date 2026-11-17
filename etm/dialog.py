@@ -189,7 +189,7 @@ def answer_question(conn, *, dialog_id: int, question_id: int, text: str | None 
             if resolved:
                 _set_state(conn, dialog_id, state)
                 # 긍정 뒤에 말이 더 있으면(예: '맞아. 다음에도 …') 일반화 지시일 수 있으므로 API 로 해석도 받는다
-                need_api = bool(text and YES_PREFIX.match(text))
+                need_api = bool(text and YES_PREFIX.match(text)) or resolved == "also_api"
         if not need_api:
             return _continue_after_server_answer(conn, dialog_id)
     return run_turn(conn, dialog_id)
@@ -349,8 +349,12 @@ def _process_response(conn, d, resp, request_id):
             if oref and (ln.get("owner_source") == "user_answer" or owner_q) and str(i) not in state.get("owners", {}):
                 lab = "자사" if oref == "own" else conn.execute("SELECT name FROM party WHERE id=?",
                                                                (int(oref.split(":")[1]),)).fetchone()["name"]
-                state.setdefault("owners", {})[str(i)] = {"value": oref, "label": lab, "source": "user_answer",
-                                                          "answer_id": last_a["id"], "via": "api_interpretation"}
+                reg = _registered_owner(conn, ref or (state.get("items", {}).get(str(i)) or {}).get("choice"))
+                if reg is None or reg == oref:
+                    state.setdefault("owners", {})[str(i)] = {"value": oref, "label": lab, "source": "user_answer",
+                                                              "answer_id": last_a["id"], "via": "api_interpretation"}
+                else:   # 모델이 읽은 소유자가 기준정보 등록 소유자와 다르다 → 기록하지 않고 확인받는다
+                    state.setdefault("owner_proposals", {})[str(i)] = {"value": oref, "label": lab}
             if ref and (ln.get("item_source") == "user_answer" or answered_this) and str(i) not in state.get("items", {}):
                 state.setdefault("items", {})[str(i)] = {"choice": ref, "source": "user_answer", "answer_id": last_a["id"],
                                                           "via": "api_interpretation"}
@@ -455,6 +459,14 @@ def _item_known(conn, ln, idx, state, company=1, supplier=""):
     if r:
         return {"choice": f"item:{r['id']}", "source": "master_exact"}
     return None
+
+
+def _registered_owner(conn, item_ref):
+    """기준정보에 등록된 임대품 소유자('party:<id>'). 임대품이 아니거나 모르면 None."""
+    if not item_ref or not str(item_ref).startswith("item:"):
+        return None
+    r = conn.execute("SELECT kind, owner_party_id FROM item WHERE id=?", (int(str(item_ref).split(":")[1]),)).fetchone()
+    return f"party:{r['owner_party_id']}" if r and r["kind"] == "rental" and r["owner_party_id"] else None
 
 
 def _named_parties(conn, d, selfn) -> list[str]:
@@ -562,9 +574,16 @@ def _gate_and_apply(conn, did, pid):
                 item = conn.execute("SELECT * FROM item WHERE id=?", (int(ik["choice"].split(":")[1]),)).fetchone()
                 mo = conn.execute("SELECT name FROM party WHERE id=?", (item["owner_party_id"],)).fetchone()
                 opts = [x for x in (mo["name"] if mo else None, pp.get("counterparty")) if x] + ["자사"]
-                _ask(conn, did, d["revision"], f"srv-owner-{i}", f"lines.{i}.owner", "missing",
-                     f"{pp.get('counterparty')}에서 온 '{item['name']}' {_fmt(qk['value'])}개는 누구 소유인가요?",
-                     list(dict.fromkeys(opts)), None, "server")
+                prop = (state.get("owner_proposals") or {}).get(str(i))
+                if prop:
+                    _ask(conn, did, d["revision"], f"srv-owner-{i}", f"lines.{i}.owner", "conflict",
+                         f"답변을 '{item['name']} {_fmt(qk['value'])}개의 소유자 = {prop['label']}'(으)로 읽었습니다. "
+                         f"기준정보의 등록 소유자는 {mo['name'] if mo else '미상'}입니다. 누구 소유인가요?",
+                         list(dict.fromkeys(opts)), None, "server")
+                else:
+                    _ask(conn, did, d["revision"], f"srv-owner-{i}", f"lines.{i}.owner", "missing",
+                         f"{pp.get('counterparty')}에서 온 '{item['name']}' {_fmt(qk['value'])}개는 누구 소유인가요?",
+                         list(dict.fromkeys(opts)), None, "server")
                 return
             state.setdefault("owners", {})[str(i)] = ok
             conf[f"lines.{i}.owner"] = _ev(ok)
@@ -638,6 +657,18 @@ def _owner_known(conn, d, pp, ln, i, state, ik):
     return None
 
 
+def _items_named_in(conn, text) -> list[int]:
+    """답변 문장에 이름·별칭이 그대로 들어 있는 기준정보 품목. 긴 이름이 짧은 이름을 포함하면 긴 쪽만."""
+    n = norm(text)
+    hits = {}
+    for r in conn.execute("SELECT id, name, code, aliases FROM item"):
+        names = [norm(x) for x in [r["name"], r["code"] or "", *json.loads(r["aliases"] or "[]")] if x and len(norm(x)) >= 3]
+        best = max((x for x in names if x in n), key=len, default=None)
+        if best:
+            hits[r["id"]] = best
+    return [i for i, b in hits.items() if not any(b != o and b in o for o in hits.values())]
+
+
 def _is_name_answer(conn, q, choice, val, loose=True) -> bool:
     """이름(업체)으로 바로 받아도 되는 답인가: 버튼 선택, 제시한 선택지, 알려진 업체명·별칭, 또는 한 단어."""
     if choice or val in json.loads(q["options"] or "[]") or val == "자사":
@@ -685,6 +716,11 @@ def _resolve_server_answer(conn, q, choice, text, state, aid) -> bool:
         if r:
             state.setdefault("items", {})[idx] = {"choice": f"item:{r['id']}", "source": "user_answer", "answer_id": aid}
             return True
+        named = _items_named_in(conn, val)
+        if len(named) == 1:   # 문장 속에 기준정보 품목 이름이 하나만 나옴 → 그 품목(나머지 내용은 API 로도 해석)
+            state.setdefault("items", {})[idx] = {"choice": f"item:{named[0]}", "source": "user_answer", "answer_id": aid,
+                                                  "via": "text_match"}
+            return "also_api"
         return False
     m = re.fullmatch(r"lines\.(\d+)\.owner", q["target"])
     if m and val and not _is_name_answer(conn, q, choice, val, loose=False):
@@ -823,7 +859,9 @@ def _apply(conn, did, pid, pp, state):
         cid = learn.record_case(conn, event_id=ev, check_id=None, kind="doc_kind", key=dkey, label=label,
                                 answer=KIND_TO_DOC[kind], actor="system", version_id=k["rule_version_id"],
                                 company_id=d["company_id"])
-    elif k["source"] == "user_answer":   # 사용자가 판단한 것만 사례(학습 재료)로 남긴다. 원문 표기로 정해진 것은 사례 아님
+    elif k["source"] == "user_answer" and kind != "return":
+        # 사용자가 판단한 것만 사례(학습 재료)로 남긴다. 원문 표기로 정해진 것은 사례 아님.
+        # 반납은 처리 기준이 없어 '보관만'으로 학습되면 안 되므로 종류 사례로 남기지 않는다(장부 반영 미결로 관리)
         cid = learn.record_case(conn, event_id=ev, check_id=None, kind="doc_kind", key=dkey, label=label,
                                 answer=KIND_TO_DOC[kind], actor=d["created_by"], company_id=d["company_id"])
     if cid:

@@ -104,6 +104,8 @@ class App:
                 return 200, seed.examples()
             if method == "GET" and path == "/api/items":
                 return 200, [dict(r) for r in c.execute("SELECT id, code, name, unit FROM item WHERE kind='product'")]
+            if method == "GET" and path == "/api/learning/timeline":
+                return 200, learn.timeline(c)
             if method == "GET" and path == "/api/learning":
                 return 200, learn.overview(c)
             m = re.fullmatch(r"/api/learning/(\w+)", path)
