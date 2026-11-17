@@ -69,8 +69,12 @@ const won = n => n == null ? "미확정" : n.toLocaleString("ko-KR") + "원";
 let current = null;     // 현재 왼쪽에 열린 사건 id
 let examples = {};
 
+let ME = (()=>{ try{ return localStorage.getItem("etm-user") || "owner"; }catch(e){ return "owner"; } })();
+function setMe(v){ ME = v; try{ localStorage.setItem("etm-user", v); }catch(e){} showLearning(); }
+const rid = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
 async function api(path, body){
-  const r = await fetch(path, body === undefined ? {} : {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+  const h = {"X-ETM-User": ME};
+  const r = await fetch(path, body === undefined ? {headers:h} : {method:"POST", headers:{...h, "Content-Type":"application/json"}, body:JSON.stringify(body)});
   const j = await r.json();
   if(!r.ok) throw new Error(j.errors ? j.errors.join("\n") : j.error);
   return j;
@@ -82,15 +86,16 @@ async function refreshSide(){
   const stock = s.stock.map(x => `${esc(x.name)} ${x.qty.toLocaleString()}${esc(x.unit)}`).join(" · ");
   const pal = s.pallets_out.reduce((a,x)=>a+x.qty,0);
   const palF = (s.rental_factory||[]).reduce((a,x)=>a+x.qty,0);
-  let rules = {proposals:0, stats:{asked:0, auto:0}};
-  try{ rules = await api("/api/rules"); }catch(e){}
+  let L = {pending:0, candidates:[], stats:{asked:0, auto:0}};
+  try{ L = await api("/api/learning"); }catch(e){}
+  const todo = L.pending + L.candidates.length + (L.lags||[]).filter(x=>x.status==="awaiting").length;
   $("#sum").innerHTML =
     `<span title="${esc(stock)}">재고 ${s.stock.length}품목 <button onclick="showStock()">보기</button></span>`+
     `<span>받을 돈 ${won(s.receivable.known)}${s.receivable.undetermined_count?` + 미확정 ${s.receivable.undetermined_count}건`:""}</span>`+
     `<span>줄 돈 ${won(s.payable.known)}${s.payable.undetermined_count?` + 미확정 ${s.payable.undetermined_count}건`:""}</span>`+
     `<span>팔레트 공장 ${palF} · 현장 ${pal}</span>`+
-    `<span><button onclick="showRules()">룰북·커리큘럼</button>${rules.proposals?` <b style="color:var(--warn)">제안 ${rules.proposals}</b>`:""}`+
-    ` <span title="사용자에게 물은 판단 / 규칙이 처리한 판단">물음 ${rules.stats.asked} · 자동 ${rules.stats.auto}</span></span>`;
+    `<span><button onclick="showLearning()">RBK·LAG</button>${todo?` <b style="color:var(--warn)">${todo}</b>`:""}`+
+    ` <span title="사용자에게 물은 판단 / 규칙이 처리한 판단">물음 ${L.stats.asked} · 자동 ${L.stats.auto}</span></span>`;
   window._summary = s;
   if(!h.days.length){ $("#hist").innerHTML = '<div class="empty">아직 처리한 기록이 없습니다.</div>'; return; }
   $("#hist").className = "";
@@ -112,35 +117,80 @@ function showStock(){
     `</table><div class="row"><button onclick="home()">닫기</button></div></div>`;
 }
 
-// ---------------- 룰북·커리큘럼
-async function showRules(){
+// ---------------- 운영 RBK·LAG (DEV-002)
+const LAG_ST = {open:"접수", verifying:"검증 중", awaiting:"판정 대기", closed:"종료", held:"보류"};
+const OUT = {rule:"규칙 반영", narrowed:"범위 축소 반영", rejected:"기각"};
+const V_ST = {pending:"승인 대기", active:"활성", suspended:"중지", superseded:"대체됨", retired:"폐기", draft:"초안"};
+async function lcmd(cmd, body){
+  try{ await api(`/api/learning/${cmd}`, {...body, request_id: rid()}); await showLearning(); }
+  catch(e){ $("#err").textContent = e.message; window.scrollTo(0,0); }
+}
+function scopeText(r, v){
+  const s = JSON.parse(v.scope||"{}"), c = JSON.parse(v.condition||"{}");
+  const parts = [r.company_id ? "회사: 기본 회사" : "공통(모든 회사)", `사건: ${({shipment:"출하",receipt:"입고",intake:"자료 접수"})[r.event_kind]||r.event_kind}`];
+  for(const [k,val] of Object.entries(s)) parts.push(`${({party_id:"거래처",site_id:"현장",item_id:"품목"})[k]} #${val}`);
+  if(Object.keys(c).length) parts.push("조건: " + Object.values(c).join(" / "));
+  return parts.join(" · ");
+}
+async function showLearning(){
   current = null;
-  const o = await api("/api/rules");
-  const learned = o.rules.filter(r=>r.decision_kind), base = o.rules.filter(r=>!r.decision_kind);
-  const st = {proposed:"규칙 제안", collecting:"학습 중", conflict:"판정 엇갈림", open:"과제"};
-  $("#left").innerHTML = `<div class="row" style="margin:0 0 8px"><button class="link" onclick="home()">← 새 자료</button></div>
+  const o = await api("/api/learning");
+  window._cands = o.candidates;
+  const me = o.users.find(u=>u.id===ME) || {name:ME, role:"?"};
+  const pend = o.rules.flatMap(r=>r.versions.filter(v=>v.status==="pending").map(v=>({r,v})));
+  const live = o.rules.flatMap(r=>r.versions.filter(v=>v.status!=="pending").map(v=>({r,v})));
+  $("#left").innerHTML = `<div class="row" style="margin:0 0 8px"><button class="link" onclick="home()">← 새 자료</button>
+     <span class="meta" style="margin-left:auto">사용자</span><select onchange="setMe(this.value)">${o.users.map(u=>`<option value="${u.id}" ${u.id===ME?"selected":""}>${esc(u.name)}</option>`).join("")}</select></div>
+  <div class="err" id="err"></div>
   <div class="card"><div class="title">판단 위임 현황</div>
-    <div class="meta">규칙이 없는 판단은 모두 사용자에게 묻습니다. 같은 답이 ${o.promote_after}번 쌓이면 규칙을 제안하고, 승인하면 그 뒤로는 묻지 않습니다.</div>
-    <div style="margin-top:6px">사용자에게 물은 판단 <b>${o.stats.asked}</b>건 · 규칙이 처리한 판단 <b>${o.stats.auto}</b>건</div></div>
-  <div class="card"><div class="title">커리큘럼 (학습·제안)</div>
-    ${o.curriculum.length?o.curriculum.map(c=>`<div class="${c.state==="proposed"?"check":""}" style="padding:6px 0;border-bottom:1px solid var(--line)">
-      <span class="chip ${c.state==="proposed"?"open":""}">${st[c.state]||esc(c.state)}</span> ${esc(c.title.replace(/^[^:]+: /,""))}
-      <div class="meta">${esc(c.evidence)}${c.decision_kind&&c.state!=="open"?` · ${c.case_count}/${o.promote_after}`:""} · ${esc(c.next_check)}</div>
-      ${c.state==="proposed"?`<div class="row"><button class="primary" onclick="approveRule(${c.id})">규칙으로 승인</button><span class="meta">승인 전까지는 계속 묻습니다</span></div>`:""}
-    </div>`).join(""):'<div class="empty">아직 없습니다.</div>'}
-  </div>
-  <div class="card"><div class="title">룰북 — 학습된 규칙</div>
-    ${learned.length?learned.map(r=>`<div style="padding:6px 0;border-bottom:1px solid var(--line)"><b>${esc(r.id)}</b> <span class="chip ${r.status==="active"?"done":""}">${esc(r.status)}</span>
-      ${esc(r.condition)} → <b>${esc(r.action)}</b><div class="meta">${esc(r.basis)} · 적용 ${r.case_count}건</div>
-      ${r.status==="active"?`<button class="link" onclick="suspendRule('${esc(r.id)}')">중지(다시 묻기)</button>`:""}</div>`).join(""):'<div class="empty">아직 없습니다.</div>'}
-  </div>
-  <div class="card"><div class="title">룰북 — 기본 규칙</div>
-    ${base.map(r=>`<div class="meta" style="padding:3px 0"><b>${esc(r.id)}</b> ${esc(r.condition)} → ${esc(r.action)} <span>(${esc(r.basis)})</span></div>`).join("")}
-  </div><div class="err" id="err"></div>`;
+    <div class="meta">활성 규칙이 없는 판단은 사용자에게 묻습니다. 사례 → LAG → 검증 → 판정 → 승인을 거친 규칙만 자동으로 처리합니다.</div>
+    <div style="margin-top:4px">물은 판단 <b>${o.stats.asked}</b> · 규칙이 처리 <b>${o.stats.auto}</b></div></div>
+  ${pend.length?`<div class="card"><div class="title">승인 대기 규칙 버전</div>${pend.map(({r,v})=>`<div class="check">
+      <div class="q">${esc(r.id)} v${v.version_no} — ${esc(r.title)}</div>
+      <div class="src">${esc(scopeText(r,v))}</div><div class="src">동작: ${esc(v.description)}</div><div class="src">근거: ${esc(v.basis)}</div>
+      <div class="row"><button class="primary" onclick="lcmd('approve',{version_id:${v.id}})">이 버전 승인·활성화</button><button onclick="lcmd('set_status',{version_id:${v.id},to:'retired'})">폐기</button><span class="meta">승인자: ${esc(me.name)}</span></div></div>`).join("")}</div>`:""}
+  ${o.candidates.length?`<div class="card"><div class="title">반복된 판단 (후보 — 자동 등록 안 함)</div>${o.candidates.map((c,ci)=>`<div style="padding:6px 0;border-bottom:1px solid var(--line)">
+      ${esc(c.label)}<div class="meta">${c.answers.map(a=>`${esc(typeof a.answer==="object"?a.answer.label:a.answer)} ${a.count}건`).join(" · ")}${c.consistent?"":" · 답이 엇갈림"}</div>
+      <button class="link" onclick="regLag(${ci})">LAG로 등록하고 사례 검증 기록</button></div>`).join("")}</div>`:""}
+  <div class="card"><div class="title">LAG — 검증 과제</div>${o.lags.length?o.lags.map(l=>`<div style="padding:6px 0;border-bottom:1px solid var(--line)">
+      <span class="chip ${l.status==="awaiting"?"open":""}">${LAG_ST[l.status]||l.status}${l.outcome?" · "+(OUT[l.outcome]||l.outcome):""}</span> LAG-${l.id} ${esc(l.question)}
+      <div class="meta">근거 ${l.links}건 · 검증 ${l.verifications.length}건${l.status_reason?" · "+esc(l.status_reason):""}${l.origin?" · 출처 "+esc(l.origin):""}</div>
+      <div class="row">${l.status==="awaiting"?`<button class="primary" onclick="judge(${l.id},'rule')">규칙 반영(승인 대기 버전 생성)</button><button onclick="judge(${l.id},'rejected')">기각</button><button onclick="judge(${l.id},'hold')">보류</button>`:""}
+        ${["open","verifying"].includes(l.status)&&l.case_ids.length?`<button onclick="lcmd('verify',{lag_id:${l.id},case_ids:${JSON.stringify(l.case_ids)},expected:'같은 상황에서 같은 답'})">사례 검증 기록</button>`:""}
+        ${["open","verifying"].includes(l.status)?`<button class="link" onclick="judge(${l.id},'hold')">보류</button>`:""}
+        ${["closed","held"].includes(l.status)?`<button class="link" onclick="judge(${l.id},'reopen')">재개</button>`:""}</div>
+      <details><summary>검증·이력</summary>${l.verifications.map(v=>`<div class="meta">검증#${v.id} ${esc(v.method)} · 기대: ${esc(v.expected)} · 관찰: ${esc(v.observed)}${v.limits?" · 한계: "+esc(v.limits):""} · ${esc(v.actor)}</div>`).join("")}
+        ${l.log.map(x=>`<div class="meta">${esc(x.at.slice(5,16).replace("T"," "))} ${esc(LAG_ST[x.from_status]||"-")} → ${esc(LAG_ST[x.to_status]||x.to_status)} ${esc(x.note||"")} (${esc(x.actor)})</div>`).join("")}</details>
+    </div>`).join(""):'<div class="empty">없습니다.</div>'}</div>
+  <div class="card"><div class="title">RBK — 규칙 버전</div>${live.length?live.map(({r,v})=>`<div style="padding:6px 0;border-bottom:1px solid var(--line)">
+      <b>${esc(r.id)} v${v.version_no}</b> <span class="chip ${v.status==="active"?"done":""}">${V_ST[v.status]||v.status}</span> ${esc(v.description)}
+      <div class="meta">${esc(scopeText(r,v))} · 적용 ${v.applied}건 · 근거: ${esc(v.basis)}</div>
+      <div class="row">${v.status==="active"?`<button class="link" onclick="lcmd('set_status',{version_id:${v.id},to:'suspended'})">중지(다시 묻기)</button>`:""}
+        ${v.status==="suspended"?`<button class="link" onclick="lcmd('set_status',{version_id:${v.id},to:'active'})">재개</button>`:""}
+        <button class="link" onclick="traceV(${v.id})">근거 추적</button></div><div id="tr${v.id}"></div></div>`).join(""):'<div class="empty">아직 승인된 규칙이 없습니다.</div>'}</div>
+  <div class="card"><div class="title">기본 동작 (코드 고정 — 규칙 아님)</div>${o.code_defaults.map(r=>`<div class="meta" style="padding:2px 0">${esc(r.moved_to.replace(/^code-default/,""))}</div>`).join("")}</div>`;
   await refreshSide();
 }
-async function approveRule(id){ try{ await api("/api/rules/approve",{curriculum_id:id}); await showRules(); }catch(e){ $("#err").textContent=e.message; } }
-async function suspendRule(id){ try{ await api("/api/rules/suspend",{rule_id:id}); await showRules(); }catch(e){ $("#err").textContent=e.message; } }
+async function regLag(i){
+  const c = window._cands[i];
+  try{
+    const r = await api("/api/learning/create_lag", {request_id: rid(), question: `${c.label} — 같은 판단을 규칙으로 해도 되는가?`,
+      context:{decision:c.decision, key:c.key, label:c.label}, case_ids:c.cases});
+    await api("/api/learning/verify", {request_id: rid(), lag_id: r.result.lag_id, case_ids: c.cases, method:"사례 대조", expected:"같은 상황에서 같은 답"});
+    await showLearning();
+  }catch(e){ $("#err").textContent = e.message; }
+}
+function judge(id, kind){
+  const reason = kind==="reopen"||kind==="hold"||kind==="rejected" ? (prompt("이유", "") ?? null) : "";
+  if(reason===null) return;
+  lcmd("judge", {lag_id:id, kind, reason});
+}
+async function traceV(id){
+  const t = await api(`/api/rule-versions/${id}/trace`);
+  $("#tr"+id).innerHTML = `<div class="meta">판정: ${t.judgments.map(j=>`${esc(j.kind)}(${esc(j.actor)})`).join(" → ")||"없음"}
+    · LAG: ${t.lag?`LAG-${t.lag.id}`:"없음(초기 제안)"} · 검증 ${t.verifications.length} · 사례 ${t.cases.length}
+    · 적용 사건: ${t.applications.map(a=>`<button class="link" onclick="openEvent(${a.event_id})">#${a.event_id}</button>(${esc(a.result)})`).join(" ")||"없음"}</div>`;
+}
 
 // ---------------- 왼쪽: 새 자료
 function home(msg){
@@ -152,6 +202,7 @@ function home(msg){
       <span class="meta">예제:</span>
       <button class="link" onclick="loadEx('scan_normal')">정상 송장</button>
       <button class="link" onclick="loadEx('scan_issues')">확인 필요한 송장</button>
+      <button class="link" onclick="loadEx('dev002_pallet_diff')">팔레트 12/13 송장</button>
       <button class="link" onclick="toggleManual()">직접입력</button></div>
     <div id="manual" hidden style="margin-top:10px">
       <div class="row"><input id="m_cust" placeholder="거래처" size="12"><input id="m_doc" placeholder="송장번호(선택)" size="12"><input id="m_date" type="date"></div>
@@ -219,6 +270,7 @@ async function openEvent(id, note){
       </table>
       ${readOnly?"":`<div class="meta" style="margin-top:6px">숫자 옆 <b>수정</b>을 누르면 차이만 다시 반영합니다(이력 보존).</div>`}
     </details>
+    ${(d.rule_applications||[]).length?`<details><summary>규칙 적용 근거 ${d.rule_applications.length}건</summary>${d.rule_applications.map(a=>`<div class="meta">${esc(a.rule)} · ${esc(a.target)} · ${esc(({performed:"자동 처리",required_confirm:"확인 요구",held_conflict:"충돌로 보류"})[a.result]||a.result)} · ${esc(a.reason)} · 사건 리비전 ${a.event_revision}</div>`).join("")}</details>`:""}
     <details><summary>원본·처리 이력</summary>
       ${d.history.map(h=>`<div class="meta">${esc(h.at.replace("T"," ").slice(5,16))} ${esc(h.summary)}</div>`).join("")}
       ${d.moves.length?`<div class="meta" style="margin-top:6px"><b>가치 이동</b></div>`+d.moves.map(m=>`<div class="meta">${esc(m.created_at.slice(5,16).replace("T"," "))} ${esc(m.item_name)} ${m.qty>0?"":"(조정) "}${m.qty} ${esc(m.unit)} · ${esc(m.from_loc)}→${esc(m.to_loc)} · ${esc(m.reason)}</div>`).join(""):""}
@@ -263,6 +315,8 @@ function renderCheck(c){
       body = `<div class="row"><button class="primary" onclick="ans(${id},{choice:'ok'})">알고 진행</button>${inp("", "수량 수정", "number")}<button onclick="ansVal(${id})">수량 수정</button></div>`; break;
     case "pallet_mismatch":
       body = `<div class="row"><button onclick="ans(${id},{choice:'invoice'})">송장 ${d.invoice}개</button><button onclick="ans(${id},{choice:'message'})">상차 메시지 ${d.message}개</button>${inp("", "실제 수량", "number")}<button onclick="ansVal(${id})">입력</button><span class="meta">나중에 해도 제품 출하 반영은 유지됩니다</span></div>`; break;
+    case "pallet_confirm":
+      body = `<div class="row"><button class="primary" onclick="ans(${id},{choice:'ok'})">${d.invoice}개 맞음</button>${inp("", "실제 수량", "number")}<button onclick="ansVal(${id})">입력</button></div>`; break;
     case "pallet_missing":
       body = `<div class="row">${inp(d.invoice??d.message, "확정 수량", "number")}<button onclick="ansVal(${id})">확정</button><span class="meta">자료가 오면 확정하세요. 그때까지 팔레트 확인 미결</span></div>`; break;
     case "doc_kind": {
@@ -279,7 +333,8 @@ function renderCheck(c){
       body = `<div class="src">기존: ${esc(d.other_title)}</div>${(d.diffs||[]).length&&d.mode==="revision_candidate"?`<div class="src">${d.diffs.map(x=>`${esc(x.label)}: ${esc(x.old)} → ${esc(x.new)}`).join(" · ")}</div>`:""}
         <div class="row"><button class="primary" onclick="ans(${id},{choice:'same'})">${d.mode==="revision_candidate"?"같은 출하 — 차이만 반영":"같은 출하 — 반영 안 함"}</button><button onclick="ans(${id},{choice:'separate'})">별개 출하</button></div>`; break;
   }
-  return `<div class="check"><div class="q">${esc(c.message)}</div>${c.rule_id?`<div class="flag">${esc(c.rule_id)}</div>`:""}${body}</div>`;
+  const why = d.why || c.rule_id || "";
+  return `<div class="check"><div class="q">${esc(c.message)}</div>${why?`<div class="flag">${esc(why)}</div>`:""}${body}</div>`;
 }
 async function ans(id, a){
   try{ const r = await api(`/api/events/${current}/answers`, {answers:{[id]:a}}); await openEvent(r.event_id); }

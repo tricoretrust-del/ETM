@@ -216,6 +216,136 @@ MIGRATIONS: list[str] = [
     );
     CREATE INDEX decision_case_key ON decision_case(decision_kind, decision_key);
     """,
+    # ---- 0003: DEV-002 운영 RBK·LAG (규칙 버전·판정·검증·적용 기록) ----------------
+    """
+    CREATE TABLE company (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+    CREATE TABLE app_user (                 -- 확인·판정·승인 주체
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        role TEXT NOT NULL,                  -- operator(확인·LAG) | approver(회사 규칙 승인) | admin(공통 규칙 승인)
+        company_id INTEGER REFERENCES company(id)
+    );
+    ALTER TABLE event ADD COLUMN company_id INTEGER NOT NULL DEFAULT 1 REFERENCES company(id);
+    ALTER TABLE event ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+    -- 확인·수정 기록 보강: 확인자·이유·원본 참조
+    ALTER TABLE confirmed_case ADD COLUMN actor TEXT;
+    ALTER TABLE confirmed_case ADD COLUMN reason TEXT;
+    ALTER TABLE confirmed_case ADD COLUMN source_ref TEXT;
+    ALTER TABLE decision_case ADD COLUMN actor TEXT;
+    ALTER TABLE decision_case ADD COLUMN company_id INTEGER NOT NULL DEFAULT 1 REFERENCES company(id);
+    ALTER TABLE decision_case ADD COLUMN rule_version_id INTEGER REFERENCES rule_version(id);
+    -- 이전 구조(rulebook·curriculum)는 지우지 않고 이관 위치만 기록한다
+    ALTER TABLE rulebook ADD COLUMN moved_to TEXT;
+    ALTER TABLE curriculum ADD COLUMN moved_to TEXT;
+
+    -- LAG: 운영 중 발견한 문제·지식 공백·검증 과제 ------------------------------
+    CREATE TABLE lag (
+        id INTEGER PRIMARY KEY,
+        company_id INTEGER NOT NULL REFERENCES company(id),
+        question TEXT NOT NULL,
+        context TEXT NOT NULL DEFAULT '{}',  -- 적용 맥락(JSON): decision, key, event_kind, scope
+        status TEXT NOT NULL,                -- open(접수) | verifying(검증 중) | awaiting(판정 대기) | closed(종료) | held(보류)
+        outcome TEXT,                        -- rule(규칙 반영) | rejected(기각) | narrowed(범위 축소) — closed 일 때
+        status_reason TEXT,
+        origin TEXT,                         -- 이관 출처 등
+        created_by TEXT NOT NULL REFERENCES app_user(id),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE lag_link (                 -- LAG ↔ 사건·확인 기록 (복수)
+        id INTEGER PRIMARY KEY,
+        lag_id INTEGER NOT NULL REFERENCES lag(id),
+        event_id INTEGER REFERENCES event(id),
+        decision_case_id INTEGER REFERENCES decision_case(id),
+        confirmed_case_id INTEGER REFERENCES confirmed_case(id),
+        CHECK (event_id IS NOT NULL OR decision_case_id IS NOT NULL OR confirmed_case_id IS NOT NULL)
+    );
+    CREATE TABLE lag_log (                  -- 상태 이력(보류·재개·기각 포함)
+        id INTEGER PRIMARY KEY,
+        lag_id INTEGER NOT NULL REFERENCES lag(id),
+        from_status TEXT, to_status TEXT NOT NULL,
+        note TEXT, actor TEXT NOT NULL REFERENCES app_user(id), at TEXT NOT NULL
+    );
+    CREATE TABLE verification (
+        id INTEGER PRIMARY KEY,
+        lag_id INTEGER NOT NULL REFERENCES lag(id),
+        method TEXT NOT NULL,
+        expected TEXT NOT NULL,
+        observed TEXT NOT NULL,
+        limits TEXT NOT NULL DEFAULT '',
+        actor TEXT NOT NULL REFERENCES app_user(id),
+        at TEXT NOT NULL
+    );
+    CREATE TABLE verification_case (
+        verification_id INTEGER NOT NULL REFERENCES verification(id),
+        decision_case_id INTEGER NOT NULL REFERENCES decision_case(id),
+        PRIMARY KEY (verification_id, decision_case_id)
+    );
+
+    -- RBK: 규칙(고정 ID)과 변경 불가능한 버전 --------------------------------
+    CREATE TABLE rule (
+        id TEXT PRIMARY KEY,                 -- 안정적인 규칙 ID
+        company_id INTEGER REFERENCES company(id),   -- NULL = 공통 규칙(admin 승인 필요)
+        event_kind TEXT NOT NULL,            -- shipment | receipt | intake
+        decision TEXT NOT NULL,              -- pallet_check | doc_kind | item_map
+        title TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE rule_version (
+        id INTEGER PRIMARY KEY,              -- 변경 불가능한 버전 ID
+        rule_id TEXT NOT NULL REFERENCES rule(id),
+        version_no INTEGER NOT NULL,
+        status TEXT NOT NULL,                -- draft | pending | active | suspended | superseded | retired
+        description TEXT NOT NULL,
+        condition TEXT NOT NULL,             -- JSON: 사실 일치 조건
+        action TEXT NOT NULL,                -- JSON: 허용 목록의 동작만
+        scope TEXT NOT NULL DEFAULT '{}',    -- JSON: party_id / site_id / item_id
+        valid_from TEXT, valid_to TEXT,
+        basis TEXT NOT NULL,                 -- 근거 설명
+        lag_id INTEGER REFERENCES lag(id),
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (rule_id, version_no)
+    );
+    -- 원자성 보조: 한 규칙에 활성 버전은 최대 1개
+    CREATE UNIQUE INDEX rule_one_active ON rule_version(rule_id) WHERE status = 'active';
+    -- 내용 불변: 조건·동작·범위·근거는 수정 불가 (상태만 바뀐다)
+    CREATE TRIGGER rule_version_immutable BEFORE UPDATE OF condition, action, scope, basis, rule_id, version_no, description
+        ON rule_version BEGIN SELECT RAISE(ABORT, 'rule_version 내용은 수정할 수 없습니다. 새 버전을 만드세요'); END;
+
+    CREATE TABLE judgment (                 -- 사용자 판정 (LAG 또는 정확한 규칙 버전 대상)
+        id INTEGER PRIMARY KEY,
+        lag_id INTEGER REFERENCES lag(id),
+        rule_version_id INTEGER REFERENCES rule_version(id),
+        kind TEXT NOT NULL,                  -- rule | rejected | narrowed | hold | reopen | approve | suspend | retire
+        reason TEXT NOT NULL DEFAULT '',
+        evidence TEXT NOT NULL DEFAULT '',
+        actor TEXT NOT NULL REFERENCES app_user(id),
+        role TEXT NOT NULL,
+        at TEXT NOT NULL,
+        CHECK ((lag_id IS NULL) <> (rule_version_id IS NULL))
+    );
+    CREATE TABLE rule_application (         -- 후속 사건에서 규칙을 쓴 기록
+        id INTEGER PRIMARY KEY,
+        event_id INTEGER NOT NULL REFERENCES event(id),
+        event_revision INTEGER NOT NULL,
+        rule_version_id INTEGER NOT NULL REFERENCES rule_version(id),
+        target TEXT NOT NULL,                -- 적용 대상(예: pallets.confirmed)
+        match_basis TEXT NOT NULL,           -- JSON: 어떤 사실이 조건·범위에 맞았나
+        input_snapshot TEXT NOT NULL,        -- JSON
+        result TEXT NOT NULL,                -- performed | required_confirm | held_conflict
+        reason TEXT NOT NULL DEFAULT '',
+        at TEXT NOT NULL
+    );
+    CREATE INDEX rule_application_event ON rule_application(event_id);
+    CREATE TABLE command_log (              -- 학습 명령 멱등성
+        request_id TEXT PRIMARY KEY,
+        command TEXT NOT NULL,
+        result TEXT NOT NULL,
+        at TEXT NOT NULL
+    );
+    """,
 ]
 
 # 이번 구현에서 명시적으로 적용하는 고정 규칙(운영 룰북 초기값)
@@ -269,6 +399,8 @@ def migrate(conn: sqlite3.Connection) -> None:
             conn.executemany(
                 "INSERT INTO curriculum(title, evidence, next_check, done_criteria) VALUES (?,?,?,?)",
                 INITIAL_CURRICULUM)
+        if i == 3:
+            _migrate_0003(conn)
         if i == 2:
             conn.execute(
                 "INSERT INTO rulebook(id, scope, condition, action, basis, version, status)"
@@ -276,6 +408,53 @@ def migrate(conn: sqlite3.Connection) -> None:
                 "'그 기준정보로 연결한다(묻지 않음)','v0.1 구현 기본값 — TRNK 검토 필요','v0.1','active')")
         conn.execute(f"PRAGMA user_version = {i}")
         conn.execute("COMMIT")
+
+
+def _migrate_0003(conn) -> None:
+    from datetime import datetime
+    t = datetime.now().isoformat(timespec="seconds")
+    conn.execute("INSERT INTO company(id, name) VALUES (1, '기본 회사')")
+    conn.executemany("INSERT INTO app_user(id, name, role, company_id) VALUES (?,?,?,1)", [
+        ("owner", "대표(승인권자)", "approver"), ("staff", "직원", "operator"),
+        ("system", "시스템(이관·초기 제안 기록용, 판정 권한 없음)", "system")])
+    # 이전 고정 규칙: 개발자가 넣은 '활성' 기록이었으므로 승인 기록으로 옮기지 않는다.
+    moved = {
+        "PALLET-DOUBLE": "rule:R-PALLET-CHECK v1 (승인 대기 초안)",
+        "HW-CONFIRM": "code-default(손글씨는 항상 확인)",
+        "UNCERTAIN-FIELD": "code-default(불확실 표시는 항상 확인)",
+        "NO-OVERWRITE": "code-default(과거값 자동 덮어쓰기 없음)",
+        "STOCK-WARN": "code-default(경고 후 확인, 차단 없음)",
+        "KPP-NO-AUTO": "code-default(임대료 채무 자동 생성 없음)",
+        "MASTER-EXACT": "code-default(기준정보 정확 일치 연결)",
+    }
+    for rid, to in moved.items():
+        conn.execute("UPDATE rulebook SET moved_to=?, status='retired' WHERE id=?", (to, rid))
+    conn.execute("UPDATE rulebook SET moved_to='재승인 필요: 이전 방식 승인은 권한·버전 기록이 없음', status='retired'"
+                 " WHERE id LIKE 'L-%'")
+    # 팔레트 대조 규칙: 승인 대기 초안으로만 등록(근거 제시). 사용자가 앱에서 범위·동작을 확인하고 승인한다.
+    conn.execute("INSERT INTO rule(id, company_id, event_kind, decision, title, created_by, created_at)"
+                 " VALUES ('R-PALLET-CHECK', 1, 'shipment', 'pallet_check', '출하 팔레트 송장·상차 메시지 대조', 'system', ?)", (t,))
+    conn.execute(
+        "INSERT INTO rule_version(rule_id, version_no, status, description, condition, action, scope, basis, created_by, created_at)"
+        " VALUES ('R-PALLET-CHECK', 1, 'pending', ?, '{}', ?, '{}', ?, 'system', ?)",
+        ("회사: 기본 회사 / 사건: 출하 전체. 송장과 상차 메시지의 팔레트 수가 같고 판독 문제가 없으면 그 수를 확정, "
+         "다르면 사용자 확인 필수, 자료가 없으면 팔레트 확인 미결",
+         '{"type": "compare_pallets", "on_match": "accept", "on_mismatch": "require_confirm"}',
+         "DEV-002 §4 지시와 RBK v0.3 사용자 결정(출하 팔레트는 매번 송장·상차 메시지로 더블체크). "
+         "개발 초기 제안이며 승인 기록 아님", t))
+    # 이전 커리큘럼 항목 분류: 개발 계획은 PLN(문서), 검증 질문은 LAG 로 옮긴다(원래 ID·상태 보존)
+    plan_like = ("처리 건수 집계 규칙", "스캔 출력 어댑터 연결")
+    for r in conn.execute("SELECT * FROM curriculum").fetchall():
+        if r["title"] in plan_like:
+            conn.execute("UPDATE curriculum SET moved_to='PLN' WHERE id=?", (r["id"],))
+            continue
+        lid = conn.execute(
+            "INSERT INTO lag(company_id, question, context, status, origin, created_by, created_at, updated_at)"
+            " VALUES (1, ?, ?, 'open', ?, 'system', ?, ?)",
+            (r["title"], '{}', f"curriculum#{r['id']} (상태 {r['state']}, 근거 {r['evidence']})", t, t)).lastrowid
+        conn.execute("INSERT INTO lag_log(lag_id, from_status, to_status, note, actor, at) VALUES (?,NULL,'open',?, 'system', ?)",
+                     (lid, f"커리큘럼 #{r['id']}에서 이관", t))
+        conn.execute("UPDATE curriculum SET moved_to=? WHERE id=?", (f"LAG:{lid}", r["id"]))
 
 
 def _split(sql: str) -> list[str]:

@@ -1,0 +1,38 @@
+{
+  "input_id": "scan-20261113-0005",
+  "channel": "scan",
+  "source_ref": "photos/2026-11-13/invoice_20261113-05.jpg (시험용)",
+  "doc_type": "shipment_invoice",
+  "doc_no": "20261113-05",
+  "trade_date": "2026-11-13",
+  "customer": "금성백조",
+  "site": "대전광역시 유성구 성북동 731-12",
+  "contact": {
+    "name": "김경섭",
+    "phone": "010-8265-3835"
+  },
+  "lines": [
+    {
+      "item": "보도블록 A형(가상)",
+      "qty": 1200,
+      "unit": "EA"
+    }
+  ],
+  "pallets": {
+    "invoice": 12,
+    "message": 13,
+    "message_ref": "kakao/2026-11-13/상차-0745 (시험용)"
+  },
+  "vehicle_no": "5006",
+  "driver_phone": "010-5055-5478",
+  "meta": {
+    "vehicle_no": {
+      "handwritten": true,
+      "raw": "5OO6"
+    },
+    "driver_phone": {
+      "handwritten": true,
+      "raw": "010-5055-5478"
+    }
+  }
+}

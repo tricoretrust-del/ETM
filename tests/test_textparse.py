@@ -89,7 +89,8 @@ class TestTextParse(unittest.TestCase):
         r = process.intake(conn, p)
         self.assertEqual([c["kind"] for c in r["checks"]], ["doc_kind"])   # 먼저 종류를 묻는다
         r = process.answer(conn, r["event_id"], {str(r["checks"][0]["id"]): {"choice": "shipment_invoice"}})
-        self.assertEqual({c["path"] for c in r["checks"]}, {"vehicle_no", "driver_phone"})
+        # 손글씨 2건 + 팔레트(활성 규칙이 없으므로 일치해도 사용자 확인)
+        self.assertEqual({c["path"] for c in r["checks"]}, {"vehicle_no", "driver_phone", "pallets.confirmed"})
         p2, _ = textparse.to_payload(INVOICE_TEXT)
         self.assertEqual(process.intake(conn, p2)["outcome"], "re_receive")
 

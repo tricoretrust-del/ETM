@@ -40,9 +40,9 @@ def item_choices(conn):
 def required_checks(conn, ev, fields) -> list[dict]:
     checks: list[dict] = []
 
-    def add(path, kind, msg, sig, rule=None, **detail):
+    def add(path, kind, msg, sig, rule=None, apps=None, **detail):
         checks.append({"path": path, "kind": kind, "message": msg, "signature": jdump(sig),
-                       "rule_id": rule, "detail": detail})
+                       "rule_id": rule, "detail": detail, "apps": apps or []})
 
     for path, fld in fields.items():
         if path.startswith("_") or fld["source"] == "user" or fld.get("ref_source"):
@@ -63,18 +63,30 @@ def required_checks(conn, ev, fields) -> list[dict]:
             key = item_key(fields, i)
             label = f"{(fields.get('supplier') or {}).get('value') or '업체 미상'} 입고 자료의 품목 '{it['value']}'"
             row = _exact_item(conn, it["value"])
-            rule = None if row else learn.find_rule(conn, "item_map", key)
-            if row:
-                it.update(ref=row["id"], value=row["name"], ref_source="rule:MASTER-EXACT")
-            elif rule:
-                ans = learn.rule_answer(rule)
-                _set_item(conn, it, ans, f"rule:{rule['id']}")
-                learn.record_case(conn, event_id=ev["id"], check_id=None, kind="item_map", key=key, label=label,
-                                  answer=ans, rule_id=rule["id"])
+            if row:   # 기본 동작(code-default): 기준정보 이름·코드·별칭 정확 일치
+                it.update(ref=row["id"], value=row["name"], ref_source="code:MASTER-EXACT")
             else:
-                add(f"lines.{i}.item", "item_map", f"{label}은(는) 무엇입니까?", {"k": key}, None,
-                    candidates=item_choices(conn), decision_key=key, decision_label=label,
-                    suggestion=learn.suggestion(conn, "item_map", key))
+                sup, _, item_text = key.partition("|")
+                status, action, ver, basis = learn.decide(conn, event=ev, decision="item_map",
+                                                          facts={"supplier": sup, "item_text": item_text})
+                if status == "rule":
+                    _set_item(conn, it, action, f"rule:{learn.version_label(ver)}")
+                    learn.record_application(conn, event_id=ev["id"], version_id=ver["id"], target=f"lines.{i}.item",
+                                             basis=basis, snapshot={"item": it["orig"], "supplier": sup},
+                                             result="performed", reason=action.get("label") or action["choice"])
+                    learn.record_case(conn, event_id=ev["id"], check_id=None, kind="item_map", key=key, label=label,
+                                      answer={"choice": action["choice"], "label": action.get("label")}, actor="system",
+                                      version_id=ver["id"], company_id=ev["company_id"])
+                else:
+                    apps = []
+                    why = "활성 규칙 없음 — 사용자 확인"
+                    if status == "conflict":
+                        why = basis
+                        apps = [{"version_id": v["id"], "basis": {"conflict": True}, "result": "held_conflict",
+                                 "reason": basis} for v in action]
+                    add(f"lines.{i}.item", "item_map", f"{label}은(는) 무엇입니까?", {"k": key}, None, apps=apps,
+                        candidates=item_choices(conn), decision_key=key, decision_label=label,
+                        suggestion=learn.suggestion(conn, "item_map", key), why=why)
         if q["value"] is None:
             add(f"lines.{i}.qty", "missing", f"{i + 1}번 품목 수량을 입력하세요", None)
     return checks

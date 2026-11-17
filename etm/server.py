@@ -19,7 +19,30 @@ class App:
         self.conn = db.connect(db_path)
         self.lock = threading.Lock()  # SQLite 단일 연결 직렬화
 
-    def handle(self, method: str, path: str, body: dict | None):
+    def learning_command(self, cmd: str, b: dict, actor: str):
+        c = self.conn
+        fns = {
+            "create_lag": lambda: {"lag_id": learn.create_lag(
+                c, actor=actor, question=b.get("question", ""), context=b.get("context") or {},
+                case_ids=b.get("case_ids") or [], event_ids=b.get("event_ids") or [])},
+            "verify": lambda: {"verification_id": learn.add_verification(
+                c, lag_id=int(b["lag_id"]), actor=actor, method=b.get("method") or "사례 대조",
+                case_ids=b.get("case_ids") or [], expected=b.get("expected") or "", limits=b.get("limits") or "")},
+            "judge": lambda: learn.judge_lag(c, lag_id=int(b["lag_id"]), actor=actor, kind=b.get("kind", ""),
+                                             reason=b.get("reason") or "", scope=b.get("scope"), action=b.get("action")),
+            "approve": lambda: learn.approve_version(c, version_id=int(b["version_id"]), actor=actor,
+                                                     reason=b.get("reason") or ""),
+            "set_status": lambda: learn.set_version_status(c, version_id=int(b["version_id"]), actor=actor,
+                                                           to=b.get("to", ""), reason=b.get("reason") or ""),
+        }
+        if cmd not in fns:
+            raise KeyError("알 수 없는 명령")
+        with process.Tx(c):
+            result = learn.idempotent(c, b.get("request_id"), cmd, fns[cmd])
+        return {"result": result, **learn.overview(c)}
+
+    def handle(self, method: str, path: str, body: dict | None, actor: str = "owner"):
+        process.ACTOR.set(actor)
         with self.lock:
             c = self.conn
             if method == "GET" and path == "/api/history":
@@ -30,16 +53,14 @@ class App:
                 return 200, seed.examples()
             if method == "GET" and path == "/api/items":
                 return 200, [dict(r) for r in c.execute("SELECT id, code, name, unit FROM item WHERE kind='product'")]
-            if method == "GET" and path == "/api/rules":
+            if method == "GET" and path == "/api/learning":
                 return 200, learn.overview(c)
-            if method == "POST" and path == "/api/rules/approve":
-                with process.Tx(c):
-                    rid = learn.approve(c, int((body or {}).get("curriculum_id", 0)))
-                return 200, {"rule_id": rid, **learn.overview(c)}
-            if method == "POST" and path == "/api/rules/suspend":
-                with process.Tx(c):
-                    learn.suspend(c, str((body or {}).get("rule_id", "")))
-                return 200, learn.overview(c)
+            m = re.fullmatch(r"/api/learning/(\w+)", path)
+            if method == "POST" and m:
+                return 200, self.learning_command(m[1], body or {}, actor)
+            m = re.fullmatch(r"/api/rule-versions/(\d+)/trace", path)
+            if method == "GET" and m:
+                return 200, learn.trace_version(c, int(m[1]))
             m = re.fullmatch(r"/api/events/(\d+)", path)
             if method == "GET" and m:
                 return 200, process.event_detail(c, int(m[1]))
@@ -92,7 +113,11 @@ def make_handler(app: App):
                 except json.JSONDecodeError:
                     return self._send(400, {"error": "JSON 형식이 아닙니다"})
             try:
-                status, payload = app.handle(method, path, body)
+                status, payload = app.handle(method, path, body, self.headers.get("X-ETM-User") or "owner")
+            except learn.Forbidden as e:
+                status, payload = 403, {"error": str(e)}
+            except learn.Conflict as e:
+                status, payload = 409, {"error": str(e)}
             except contract.ContractError as e:
                 status, payload = 400, {"error": "입력 형식 오류", "errors": e.errors}
             except (ValueError, KeyError) as e:

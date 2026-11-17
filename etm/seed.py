@@ -28,6 +28,7 @@ DEMO_PRICES = [  # item code, party name or None, unit price, tax
     # ILK-C 단가 없음 → 금액 미확정 시나리오
 ]
 DEMO_OPENING = {"BLK-A": 5000, "CRB-B": 800, "ILK-C": 300}
+DEMO_PALLETS_AT_FACTORY = 200   # KPP 팔레트 공장 보유 기초값(가상)
 
 
 def seed_demo(conn) -> None:
@@ -52,6 +53,10 @@ def seed_demo(conn) -> None:
         for code, qty in DEMO_OPENING.items():
             conn.execute("INSERT INTO value_move(event_id, item_id, from_loc, to_loc, owner, qty, reason, created_at)"
                          " VALUES (NULL, ?, 'opening', 'factory', 'own', ?, 'opening', ?)", (iid[code], qty, now()))
+    with Tx(conn):
+        conn.execute("INSERT INTO value_move(event_id, item_id, from_loc, to_loc, owner, qty, reason, created_at)"
+                     " VALUES (NULL, ?, 'opening', 'factory', ?, ?, 'opening', ?)",
+                     (iid["KPP-PLT"], f"party:{pid['KPP']}", DEMO_PALLETS_AT_FACTORY, now()))
     # 과거 출하 1건(가상): 담당자 후보 검색의 근거가 된다.
     process.intake(conn, PRIOR_SHIPMENT)
 
@@ -121,6 +126,24 @@ def examples() -> dict[str, dict]:
                 "driver_phone": {"handwritten": True, "raw": "010-1111-2222"},
                 "lines.1.item": {"uncertain": True, "raw": "보도블럭 A"},
             },
+        },
+        # DEV-002 §4 예시(시험용): 송장 팔레트 12 / 상차 메시지 13, 손글씨 차량번호·기사전화
+        "dev002_pallet_diff": {
+            "input_id": "scan-20261113-0005",
+            "channel": "scan",
+            "source_ref": "photos/2026-11-13/invoice_20261113-05.jpg (시험용)",
+            "doc_type": "shipment_invoice",
+            "doc_no": "20261113-05",
+            "trade_date": "2026-11-13",
+            "customer": "금성백조",
+            "site": "대전광역시 유성구 성북동 731-12",
+            "contact": {"name": "김경섭", "phone": "010-8265-3835"},
+            "lines": [{"item": "보도블록 A형(가상)", "qty": 1200, "unit": "EA"}],
+            "pallets": {"invoice": 12, "message": 13, "message_ref": "kakao/2026-11-13/상차-0745 (시험용)"},
+            "vehicle_no": "5006",
+            "driver_phone": "010-5055-5478",
+            "meta": {"vehicle_no": {"handwritten": True, "raw": "5OO6"},
+                     "driver_phone": {"handwritten": True, "raw": "010-5055-5478"}},
         },
         # 직접입력: 아는 값만 먼저
         "manual_minimal": {

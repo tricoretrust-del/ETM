@@ -133,7 +133,8 @@ class TestDev001(Base):
     def test_04_handwriting(self):
         r = process.intake(self.conn, self.ex["scan_issues"])
         v = next(c for c in r["checks"] if c["path"] == "vehicle_no")
-        self.assertEqual(v["rule_id"], "HW-CONFIRM")
+        self.assertIsNone(v["rule_id"])                          # 승인된 규칙이 아니라 기본 동작
+        self.assertIn("손글씨", v["detail"]["why"])
         self.assertEqual(v["detail"]["raw"], "8l23")
         self.assertEqual(v["detail"]["extracted"], "8123")
         process.answer(self.conn, r["event_id"], {str(v["id"]): {"value": "8123"}})

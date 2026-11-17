@@ -21,6 +21,11 @@ from typing import Any, Callable
 
 from . import contract
 
+import contextvars
+
+# 지금 처리하는 사용자(확인자). 서버는 요청마다 설정한다.
+ACTOR: contextvars.ContextVar[str] = contextvars.ContextVar("actor", default="owner")
+
 # 시험용 장애 주입 지점: reconcile 중간(재고 기록 후, 돈 기록 전)에 호출된다.
 FAULT_HOOK: Callable[[], None] | None = None
 
@@ -69,6 +74,8 @@ class Tx:
 
 
 def log(conn, event_id, action, summary, detail=None):
+    if event_id:
+        conn.execute("UPDATE event SET revision = revision + 1 WHERE id=?", (event_id,))
     conn.execute("INSERT INTO history(event_id, at, action, summary, detail) VALUES (?,?,?,?,?)",
                  (event_id, now(), action, summary, jdump(detail or {})))
 
@@ -207,9 +214,9 @@ def required_checks(conn, ev, fields) -> list[dict]:
     """현재 필드 상태에서 사용자에게 물어야 할 것만 계산한다. 자동 확정 가능한 것은 fields 에 반영."""
     checks: list[dict] = []
 
-    def add(path, kind, msg, sig, rule=None, **detail):
+    def add(path, kind, msg, sig, rule=None, apps=None, **detail):
         checks.append({"path": path, "kind": kind, "message": msg, "signature": jdump(sig),
-                       "rule_id": rule, "detail": detail})
+                       "rule_id": rule, "detail": detail, "apps": apps or []})
 
     # 1) 손글씨·불확실 표시 필드
     for path, fld in fields.items():
@@ -292,23 +299,46 @@ def required_checks(conn, ev, fields) -> list[dict]:
                     add(f"lines.{i}.qty", "stock", f"{item['name']} 재고 부족: 현재 {avail:g}{item['unit']}, 출하 {needed:g}{item['unit']}",
                         {"item": item["id"], "need": needed}, "STOCK-WARN", available=avail, needed=needed)
 
-    # 6) 팔레트 더블체크 (송장 vs 상차자 메시지)
+    # 6) 팔레트: 활성 규칙(R-PALLET-CHECK 등)이 있을 때만 대조 결과로 확정한다. 없으면 사용자에게 묻는다.
+    from . import learn
     pi, pm = fields["pallets.invoice"], fields["pallets.message"]
     pc = fields.get("pallets.confirmed")
-    if pc is None or pc["source"] != "user":
-        if pi["value"] is not None and pm["value"] is not None and pi["value"] == pm["value"] \
-                and not ({"handwritten", "uncertain"} & (set(pi["flags"]) | set(pm["flags"]))):
-            fields["pallets.confirmed"] = {"value": pi["value"], "orig": pi["value"], "raw": None,
-                                           "flags": [], "source": "double_check"}
-        elif pi["value"] is not None or pm["value"] is not None:
-            fields.pop("pallets.confirmed", None)
-            kind = "pallet_mismatch" if (pi["value"] is not None and pm["value"] is not None) else "pallet_missing"
-            msg = (f"팔레트 수량 불일치: 송장 {pi['value']} / 상차 메시지 {pm['value']}" if kind == "pallet_mismatch"
-                   else f"팔레트 더블체크 자료 부족: 송장 {_fmt(pi['value'])} / 상차 메시지 {_fmt(pm['value'])}")
-            add("pallets.confirmed", kind, msg, {"i": pi["orig"], "m": pm["orig"]}, "PALLET-DOUBLE",
-                invoice=pi["value"], message=pm["value"], deferrable=True)
+    if pc is not None and (pc["source"] == "user" or str(pc["source"]).startswith("rule:")):
+        pass
+    elif pi["value"] is not None or pm["value"] is not None:
+        fields.pop("pallets.confirmed", None)
+        both = pi["value"] is not None and pm["value"] is not None
+        flagged = bool({"handwritten", "uncertain"} & (set(pi["flags"]) | set(pm["flags"])))
+        equal = both and pi["value"] == pm["value"] and not flagged
+        facts = {"party_id": cust.get("ref"), "site_id": site.get("ref")}
+        status, action, ver, basis = learn.decide(conn, event=ev, decision="pallet_check", facts=facts)
+        snap = {"invoice": pi["value"], "message": pm["value"], "flagged": flagged}
+        if status == "rule" and equal and action["on_match"] == "accept":
+            fields["pallets.confirmed"] = {"value": pi["value"], "orig": pi["value"], "raw": None, "flags": [],
+                                           "source": f"rule:{learn.version_label(ver)}"}
+            learn.record_application(conn, event_id=ev["id"], version_id=ver["id"], target="pallets.confirmed",
+                                     basis=basis, snapshot=snap, result="performed", reason="송장·메시지 일치 → 확정")
         else:
-            fields.pop("pallets.confirmed", None)
+            if not both:
+                kind = "pallet_missing"
+                msg = f"팔레트 더블체크 자료 부족: 송장 {_fmt(pi['value'])} / 상차 메시지 {_fmt(pm['value'])}"
+            elif pi["value"] != pm["value"]:
+                kind, msg = "pallet_mismatch", f"팔레트 수량 불일치: 송장 {pi['value']} / 상차 메시지 {pm['value']}"
+            else:
+                kind, msg = "pallet_confirm", f"팔레트 수량 확인: 송장 {pi['value']} / 상차 메시지 {pm['value']}"
+            apps, rule_id, why = [], None, "활성 규칙 없음 — 사용자 확인"
+            if status == "rule":
+                rule_id, why = learn.version_label(ver), f"규칙 {learn.version_label(ver)}: 확인 필수"
+                apps = [{"version_id": ver["id"], "basis": basis, "result": "required_confirm", "reason": msg}]
+            elif status == "conflict":
+                vers, reason = action, basis      # decide(): ('conflict', [버전들], None, 이유)
+                why = reason
+                apps = [{"version_id": v["id"], "basis": {"conflict": True}, "result": "held_conflict", "reason": reason}
+                        for v in vers]
+            add("pallets.confirmed", kind, msg, {"i": pi["orig"], "m": pm["orig"], "k": kind}, rule_id,
+                apps=apps, invoice=pi["value"], message=pm["value"], deferrable=True, why=why)
+    else:
+        fields.pop("pallets.confirmed", None)
     # 같은 필드에 '판독 확인'과 '후보 선택'이 겹치면 후보 선택 한 번으로 묻는다(질문 수 최소화)
     matched = {c["path"] for c in checks if c["kind"] == "match"}
     return [c for c in checks if not (c["kind"] == "verify" and c["path"] in matched)]
@@ -331,6 +361,14 @@ LABEL = {
 }
 
 
+CODE_DEFAULTS = {
+    "HW-CONFIRM": "기본 동작: 손글씨는 항상 확인",
+    "UNCERTAIN-FIELD": "기본 동작: 판독 불확실 값은 확인",
+    "NO-OVERWRITE": "기본 동작: 기존 기록과 다르면 후보 제시 후 확인(자동 덮어쓰기 없음)",
+    "STOCK-WARN": "기본 동작: 경고 후 확인(차단 없음)",
+}
+
+
 def sync_checks(conn, ev, fields) -> list[dict]:
     """필요한 확인 목록과 저장된 확인 요청을 맞춘다. 이미 답한 같은 질문은 다시 묻지 않는다."""
     identity_open = conn.execute(
@@ -346,6 +384,10 @@ def sync_checks(conn, ev, fields) -> list[dict]:
     keep = set()
     created = []
     for c in needed:
+        # 예전 고정 규칙 ID 는 승인된 규칙이 아니므로 '기본 동작' 설명으로 바꿔 보여준다
+        if c.get("rule_id") in CODE_DEFAULTS:
+            c["detail"].setdefault("why", CODE_DEFAULTS[c["rule_id"]])
+            c["rule_id"] = None
         key = (c["path"], c["kind"], c["signature"])
         r = by_key.get(key)
         if r and r["state"] == "answered":
@@ -362,6 +404,11 @@ def sync_checks(conn, ev, fields) -> list[dict]:
             (ev["id"], c["path"], c["kind"], c["signature"], c["rule_id"], c["message"], jdump(c["detail"]), now()))
         keep.add(cur.lastrowid)
         created.append(c)
+        if c.get("apps"):
+            from . import learn
+            for a in c["apps"]:
+                learn.record_application(conn, event_id=ev["id"], version_id=a["version_id"], target=c["path"],
+                                         basis=a["basis"], snapshot=c["detail"], result=a["result"], reason=a["reason"])
     for r in existing:
         if r["state"] == "open" and r["id"] not in keep:
             conn.execute("UPDATE check_item SET state='void', answered_at=? WHERE id=?", (now(), r["id"]))
@@ -506,7 +553,7 @@ def reconcile(conn, event_id) -> dict:
             ob["stock_out"] = ("done", f"{len(lines)}줄 반영")
         if pallet_qty is not None:
             src = fields["pallets.confirmed"]["source"]
-            ob["pallet_check"] = ("done", f"{pallet_qty:g}개 ({'송장·메시지 일치' if src == 'double_check' else '사용자 확인'})")
+            ob["pallet_check"] = ("done", f"{pallet_qty:g}개 ({src[5:] + ' 일치 확정' if str(src).startswith('rule:') else '사용자 확인'})")
         elif has_pallet_data or pal:
             ob["pallet_check"] = ("open", "송장·상차 메시지 대조 필요")
         else:
@@ -631,8 +678,8 @@ def _intake_tx(conn, payload: dict, decided_by: str | None = None) -> dict:
     # (a) 같은 내용 재수신 → 기존 사건에 증빙만 연결, 추가 반영 없음
     same = conn.execute(
         "SELECT COALESCE(e.merged_into, e.id) event_id FROM intake i JOIN event e ON e.id=i.event_id"
-        " WHERE i.payload_hash=? AND e.status IN ('active','held','pending','merged') ORDER BY i.id LIMIT 1",
-        (h,)).fetchone()
+        " WHERE i.payload_hash=? AND e.company_id=? AND e.status IN ('active','held','pending','merged') ORDER BY i.id LIMIT 1",
+        (h, int(payload.get("company_id") or 1))).fetchone()
     if same:
         ev_id = same["event_id"]
         header = {"input_id": payload.get("input_id"), "channel": payload.get("channel"),
@@ -647,13 +694,19 @@ def _intake_tx(conn, payload: dict, decided_by: str | None = None) -> dict:
     if not payload.get("doc_type") and payload.get("raw_text"):
         key = payload.get("form_key") or ""
         label = f"항목 구성이 [{key or '없음'}]인 자료"
-        rule = learn.find_rule(conn, "doc_kind", key)
-        if rule:
-            res = _intake_tx(conn, _rebuild(conn, payload, learn.rule_answer(rule)), decided_by=rule["id"])
+        company = int(payload.get("company_id") or 1)
+        status, action, ver, basis = learn.decide(conn, event={"company_id": company, "trade_date": None},
+                                                  decision="doc_kind", facts={"form_key": key})
+        if status == "rule":
+            kind = action["value"]
+            res = _intake_tx(conn, _rebuild(conn, payload, kind), decided_by=learn.version_label(ver))
+            learn.record_application(conn, event_id=res["event_id"], version_id=ver["id"], target="doc_kind",
+                                     basis=basis, snapshot={"form_key": key}, result="performed",
+                                     reason=contract.DOC_KIND_CHOICES[kind])
             learn.record_case(conn, event_id=res["event_id"], check_id=None, kind="doc_kind", key=key, label=label,
-                              answer=learn.rule_answer(rule), rule_id=rule["id"])
+                              answer=kind, actor="system", version_id=ver["id"], company_id=company)
             return res
-        return _pending_kind(conn, payload, h, key, label)
+        return _pending_kind(conn, payload, h, key, label, conflict=(action, basis) if status == "conflict" else None)
 
     header, fields = contract.normalize(payload)
     by_rule = f" · 규칙 {decided_by}로 종류 판정" if decided_by else ""
@@ -690,8 +743,8 @@ def _intake_tx(conn, payload: dict, decided_by: str | None = None) -> dict:
     outcome, dup = "new", None
     doc_no = fields["doc_no"]["value"]
     cust_n = norm(fields["customer"]["value"])
-    for r in conn.execute("SELECT * FROM event WHERE status='active' AND kind='shipment' AND id<>? AND doc_type=?",
-                          (ev_id, header["doc_type"])).fetchall():
+    for r in conn.execute("SELECT * FROM event WHERE status='active' AND kind='shipment' AND id<>? AND doc_type=?"
+                          " AND company_id=?", (ev_id, header["doc_type"], int(payload.get("company_id") or 1))).fetchall():
         rf = json.loads(r["fields"])
         r_cust = norm(rf["customer"]["value"])
         if doc_no and r["doc_no"] == doc_no and (not cust_n or not r_cust or cust_n == r_cust):
@@ -717,6 +770,7 @@ def _intake_tx(conn, payload: dict, decided_by: str | None = None) -> dict:
 
 
 def _insert_intake(conn, header, payload, h, ev_id, outcome):
+    conn.execute("UPDATE event SET company_id=? WHERE id=?", (int(payload.get("company_id") or 1), ev_id))
     conn.execute("INSERT INTO intake(input_id, channel, source_ref, received_at, payload, payload_hash, event_id, outcome)"
                  " VALUES (?,?,?,?,?,?,?,?)",
                  (header["input_id"], header["channel"], header["source_ref"], now(), jdump(payload), h, ev_id, outcome))
@@ -729,16 +783,16 @@ def _finish_intake(conn, ev_id, header, outcome, by_rule=""):
     changes = reconcile(conn, ev_id)
     eff = describe_changes(conn, changes)
     _, fields = load_event(conn, ev_id)
-    learned = sorted({f["ref_source"][5:] for f in fields.values()
-                      if isinstance(f, dict) and str(f.get("ref_source", "")).startswith("rule:L-")})
-    if learned:
-        by_rule += f" · 규칙 {', '.join(learned)}로 품목 연결"
+    used = sorted({str(f.get(k))[5:] for f in fields.values() if isinstance(f, dict)
+                   for k in ("ref_source", "source") if str(f.get(k, "")).startswith("rule:")})
+    if used:
+        by_rule += f" · 규칙 {', '.join(used)} 적용"
     log(conn, ev_id, "intake", f"{'스캔' if header['channel'] == 'scan' else '직접입력'} 접수 · {event_title(conn, ev_id)}"
         + (f" · {eff}" if eff else "") + by_rule, {"changes": changes, "input_id": header["input_id"]})
     return {"event_id": ev_id, "outcome": outcome, "checks": _checks_out(conn, ev_id)}
 
 
-def _pending_kind(conn, payload, h, key, label):
+def _pending_kind(conn, payload, h, key, label, conflict=None):
     """자료 종류를 사용자에게 묻는다. 미리보기용 해석은 저장하지만 아무것도 반영하지 않는다."""
     from . import learn
     guess = payload.get("doc_type_guess") or "shipment_invoice"
@@ -753,11 +807,16 @@ def _pending_kind(conn, payload, h, key, label):
     detail = {"decision_key": key, "decision_label": label,
               "choices": [{"choice": k, "label": v} for k, v in contract.DOC_KIND_CHOICES.items()],
               "suggestion": sug,
-              "hint": None if sug else {"answer": guess, "why": _guess_reason(payload)}}
+              "hint": None if sug else {"answer": guess, "why": _guess_reason(payload)},
+              "why": conflict[1] if conflict else "활성 규칙 없음 — 사용자 확인"}
     conn.execute(
         "INSERT INTO check_item(event_id, path, kind, signature, rule_id, message, detail, state, created_at)"
         " VALUES (?, '_doc_kind', 'doc_kind', ?, NULL, ?, ?, 'open', ?)",
         (ev_id, jdump({"k": key}), "이 자료는 어떤 이동입니까?", jdump(detail), t))
+    if conflict:
+        for v in conflict[0]:
+            learn.record_application(conn, event_id=ev_id, version_id=v["id"], target="doc_kind", basis={"conflict": True},
+                                     snapshot={"form_key": key}, result="held_conflict", reason=conflict[1])
     log(conn, ev_id, "intake", f"접수 · 자료 종류 확인 대기 · {_preview(fields)}")
     return {"event_id": ev_id, "outcome": "pending", "checks": _checks_out(conn, ev_id)}
 
@@ -802,9 +861,11 @@ def _diff_fields(old, new):
     return out
 
 
-def answer(conn, event_id: int, answers: dict[str, dict]) -> dict:
+def answer(conn, event_id: int, answers: dict[str, dict], actor: str | None = None) -> dict:
     """확인 요청에 대한 응답 반영. answers = {check_id: {"choice":..., "value":...}}
     응답한 것만 반영하고, 응답하지 않은 확인은 그대로 남긴다."""
+    if actor:
+        ACTOR.set(actor)
     with Tx(conn):
         ev, fields = load_event(conn, event_id)
         confirmed = []
@@ -823,8 +884,9 @@ def answer(conn, event_id: int, answers: dict[str, dict]) -> dict:
             conn.execute("UPDATE check_item SET state='answered', answer=?, answered_at=? WHERE id=?",
                          (jdump(ans), now(), chk["id"]))
             after = (fields.get(chk["path"]) or {}).get("value")
-            conn.execute("INSERT INTO confirmed_case(event_id, check_id, path, before_value, after_value, at)"
-                         " VALUES (?,?,?,?,?,?)", (event_id, chk["id"], chk["path"], jdump(before), jdump(after), now()))
+            conn.execute("INSERT INTO confirmed_case(event_id, check_id, path, before_value, after_value, at, actor, reason, source_ref)"
+                         " VALUES (?,?,?,?,?,?,?,?,?)", (event_id, chk["id"], chk["path"], jdump(before), jdump(after), now(),
+                                                       ACTOR.get(), (ans or {}).get("reason"), _source_ref(conn, event_id)))
             confirmed.append(f"{LABEL.get(_lbl(chk['path']), chk['path'] if chk['path'] != '_identity' else '동일 여부')}"
                              + (f" {after}" if after is not None and chk["kind"] != "identity" else ""))
         save_fields(conn, event_id, fields)
@@ -857,7 +919,7 @@ def _answer_doc_kind(conn, ev, chk, ans):
     res = _intake_tx(conn, _rebuild(conn, payload, kind))
     conn.execute("UPDATE event SET status='merged', merged_into=?, updated_at=? WHERE id=?", (res["event_id"], now(), ev["id"]))
     learn.record_case(conn, event_id=res["event_id"], check_id=chk["id"], kind="doc_kind", key=detail["decision_key"],
-                      label=detail["decision_label"], answer=kind)
+                      label=detail["decision_label"], answer=kind, actor=ACTOR.get(), company_id=ev["company_id"])
     log(conn, ev["id"], "confirm", f"자료 종류: {contract.DOC_KIND_CHOICES[kind]}")
     return {"event_id": res["event_id"], "checks": res["checks"]}
 
@@ -876,7 +938,7 @@ def _apply_answer(conn, ev, fields, chk, ans):
         from . import learn, receipt
         decision = receipt.apply_item_answer(conn, fields, chk, ans)
         learn.record_case(conn, event_id=ev["id"], check_id=chk["id"], kind="item_map", key=detail["decision_key"],
-                          label=detail["decision_label"], answer=decision)
+                          label=detail["decision_label"], answer=decision, actor=ACTOR.get(), company_id=ev["company_id"])
         return None
 
     if kind == "identity":
@@ -957,8 +1019,10 @@ def _apply_answer(conn, ev, fields, chk, ans):
             set_user(path, contract._num_or_none(value, path, []))
         return None  # 'ok' = 재고 부족을 알고 진행
 
-    if kind in ("pallet_mismatch", "pallet_missing"):
-        if choice == "invoice":
+    if kind in ("pallet_mismatch", "pallet_missing", "pallet_confirm"):
+        if choice == "ok" and detail.get("invoice") is not None and detail.get("invoice") == detail.get("message"):
+            value = detail["invoice"]
+        elif choice == "invoice":
             value = detail["invoice"]
         elif choice == "message":
             value = detail["message"]
@@ -995,8 +1059,15 @@ def _merge_revision(conn, other_id, new_fields, from_event):
         + (f" · {eff}" if eff else ""), {"changes": changes, "diffs": diffs})
 
 
-def revise(conn, event_id: int, changes_in: dict[str, Any]) -> dict:
+def _source_ref(conn, event_id):
+    r = conn.execute("SELECT source_ref, input_id FROM intake WHERE event_id=? ORDER BY id LIMIT 1", (event_id,)).fetchone()
+    return (r["source_ref"] or f"intake:{r['input_id']}") if r else None
+
+
+def revise(conn, event_id: int, changes_in: dict[str, Any], actor: str | None = None) -> dict:
     """사용자가 상세 화면에서 값을 직접 고칠 때. 이전 반영분과의 차이만 기록한다."""
+    if actor:
+        ACTOR.set(actor)
     with Tx(conn):
         ev, fields = load_event(conn, event_id)
         if ev["status"] != "active":
@@ -1025,8 +1096,9 @@ def revise(conn, event_id: int, changes_in: dict[str, Any]) -> dict:
                 if pc and pc["source"] != "user":
                     fields.pop("pallets.confirmed")
             diffs.append({"path": path, "label": LABEL.get(_lbl(path), path), "old": old, "new": v})
-            conn.execute("INSERT INTO confirmed_case(event_id, check_id, path, before_value, after_value, at)"
-                         " VALUES (?,?,?,?,?,?)", (event_id, None, path, jdump(old), jdump(v), now()))
+            conn.execute("INSERT INTO confirmed_case(event_id, check_id, path, before_value, after_value, at, actor, reason, source_ref)"
+                         " VALUES (?,?,?,?,?,?,?,?,?)", (event_id, None, path, jdump(old), jdump(v), now(), ACTOR.get(),
+                                                       "상세 화면 수정", _source_ref(conn, event_id)))
         if not diffs:
             return {"event_id": event_id, "checks": _checks_out(conn, event_id)}
         save_fields(conn, event_id, fields)
@@ -1068,6 +1140,13 @@ def event_detail(conn, event_id) -> dict:
             "SELECT id, path, kind, message, answer, answered_at FROM check_item WHERE event_id=? AND state='answered' ORDER BY id",
             (event_id,))],
         "moves": moves, "claims": claims,
+        "company_id": ev["company_id"], "revision": ev["revision"], "kind": ev["kind"],
+        "rule_applications": [dict(r) for r in conn.execute(
+            "SELECT a.*, v.rule_id || ' v' || v.version_no AS rule, v.description FROM rule_application a"
+            " JOIN rule_version v ON v.id=a.rule_version_id WHERE a.event_id=? ORDER BY a.id", (event_id,))],
+        "confirmations": [dict(r) for r in conn.execute(
+            "SELECT path, before_value, after_value, actor, reason, at FROM confirmed_case WHERE event_id=? ORDER BY id",
+            (event_id,))],
         "obligations": [dict(r) | {"label": OBLIGATION_LABEL[r["kind"]]} for r in conn.execute(
             "SELECT * FROM obligation WHERE event_id=? AND state<>'n/a' ORDER BY id", (event_id,))],
         "intakes": [dict(r) for r in conn.execute(
