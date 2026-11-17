@@ -1,0 +1,12 @@
+{
+  "input_id": "manual-0001",
+  "channel": "manual",
+  "doc_type": "shipment_invoice",
+  "customer": "나성씨앤디",
+  "lines": [
+    {
+      "item": "경계석B",
+      "qty": 30
+    }
+  ]
+}

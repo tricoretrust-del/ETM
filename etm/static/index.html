@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ETM</title>
+<style>
+:root{
+  --bg:#f6f5f2; --panel:#ffffff; --ink:#1d1d1b; --muted:#6b6a66; --line:#e4e2dc;
+  --accent:#2f5d8a; --accent-ink:#ffffff; --warn:#a15c00; --warn-bg:#fff4e0; --ok:#2e7d4f; --ok-bg:#e8f4ec;
+  --open:#8a3b2f; --chip:#f0eee9;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#161615; --panel:#1f1f1d; --ink:#ecebe7; --muted:#a09e98; --line:#33322f;
+    --accent:#7fb0e0; --accent-ink:#0f1a26; --warn:#f0b35c; --warn-bg:#3a2c16; --ok:#7cc79a; --ok-bg:#1d3326;
+    --open:#e8907f; --chip:#2a2927; }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Malgun Gothic","Noto Sans KR",sans-serif}
+header{display:flex;align-items:baseline;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line)}
+header b{font-size:15px;letter-spacing:.04em}
+header .sum{color:var(--muted);font-size:13px;display:flex;gap:14px;flex-wrap:wrap}
+header .sum button{all:unset;cursor:pointer;color:var(--accent)}
+main{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:0;height:calc(100vh - 45px)}
+section{overflow:auto;padding:16px}
+#left{border-right:1px solid var(--line)}
+h2{font-size:13px;color:var(--muted);font-weight:600;margin:0 0 8px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:12px}
+.title{font-weight:600;margin-bottom:4px}
+.meta{color:var(--muted);font-size:12px}
+textarea,input,select{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 8px}
+textarea{width:100%;min-height:90px;font-family:ui-monospace,Menlo,monospace;font-size:12px}
+button{font:inherit;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:6px;padding:5px 10px;cursor:pointer}
+button.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+button.link{border:none;background:none;color:var(--accent);padding:2px 4px}
+.row{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px}
+.check{border-left:3px solid var(--warn);background:var(--warn-bg);border-radius:6px;padding:8px 10px;margin:8px 0}
+.check .q{font-weight:600}
+.check .src{font-size:12px;color:var(--muted)}
+.chip{display:inline-block;background:var(--chip);border-radius:10px;padding:1px 8px;font-size:12px;margin:2px 4px 0 0}
+.chip.open{color:var(--open)}
+.chip.done{color:var(--ok)}
+.day{margin-bottom:14px}
+.day h3{font-size:12px;color:var(--muted);margin:0 0 4px;font-weight:600;position:sticky;top:-16px;background:var(--bg);padding:4px 0}
+.h{padding:7px 8px;border-radius:6px;cursor:pointer;border-bottom:1px solid var(--line)}
+.h:hover{background:var(--panel)}
+.h .t{font-size:12px;color:var(--muted);margin-right:6px}
+.err{color:var(--open);font-size:13px;margin-top:6px;white-space:pre-wrap}
+table{border-collapse:collapse;width:100%;font-size:13px}
+td{padding:3px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+td:first-child{color:var(--muted);width:34%}
+details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:8px}
+pre{white-space:pre-wrap;font-size:11px;background:var(--bg);padding:8px;border-radius:6px;overflow:auto}
+.empty{color:var(--muted);font-size:13px}
+.flag{font-size:11px;color:var(--warn)}
+@media (max-width:760px){ main{grid-template-columns:1fr;height:auto} #left{border-right:none;border-bottom:1px solid var(--line)} section{padding:12px 16px} }
+</style>
+</head>
+<body>
+<header><b>ETM</b><div class="sum" id="sum"></div></header>
+<main>
+  <section id="left"></section>
+  <section id="right"><h2>처리 이력</h2><div id="hist" class="empty">불러오는 중…</div></section>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const won = n => n == null ? "미확정" : n.toLocaleString("ko-KR") + "원";
+let current = null;     // 현재 왼쪽에 열린 사건 id
+let examples = {};
+
+async function api(path, body){
+  const r = await fetch(path, body === undefined ? {} : {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+  const j = await r.json();
+  if(!r.ok) throw new Error(j.errors ? j.errors.join("\n") : j.error);
+  return j;
+}
+
+// ---------------- 오른쪽: 요약 + 히스토리
+async function refreshSide(){
+  const [s, h] = await Promise.all([api("/api/summary"), api("/api/history")]);
+  const stock = s.stock.map(x => `${esc(x.name)} ${x.qty.toLocaleString()}${esc(x.unit)}`).join(" · ");
+  const pal = s.pallets_out.reduce((a,x)=>a+x.qty,0);
+  $("#sum").innerHTML =
+    `<span title="${esc(stock)}">재고 ${s.stock.length}품목 <button onclick="showStock()">보기</button></span>`+
+    `<span>받을 돈 ${won(s.receivable.known)}${s.receivable.undetermined_count?` + 미확정 ${s.receivable.undetermined_count}건`:""}</span>`+
+    `<span>줄 돈 ${won(s.payable.known)}${s.payable.undetermined_count?` + 미확정 ${s.payable.undetermined_count}건`:""}</span>`+
+    `<span>팔레트 현장 ${pal}개</span>`;
+  window._summary = s;
+  if(!h.days.length){ $("#hist").innerHTML = '<div class="empty">아직 처리한 기록이 없습니다.</div>'; return; }
+  $("#hist").className = "";
+  $("#hist").innerHTML = h.days.map(d => `<div class="day"><h3>${esc(d.date)} · ${d.items.length}건 처리</h3>`+
+    d.items.map(i => `<div class="h" onclick="openEvent(${i.event_id})">`+
+      `<span class="t">${esc(i.at.slice(11,16))}</span>${esc(i.summary)}`+
+      (i.remaining.length ? `<div>${i.remaining.map(r=>`<span class="chip open">${esc(r.label)}${r.note?": "+esc(r.note):""}</span>`).join("")}</div>` : "")+
+      `</div>`).join("") + `</div>`).join("");
+}
+
+function showStock(){
+  const s = window._summary; current = null;
+  $("#left").innerHTML = `<div class="card"><div class="title">현재 재고 (공장)</div><table>`+
+    s.stock.map(x=>`<tr><td>${esc(x.name)}</td><td>${x.qty.toLocaleString()} ${esc(x.unit)}</td></tr>`).join("")+
+    `</table><div class="title" style="margin-top:12px">현장 체류 팔레트</div><table>`+
+    (s.pallets_out.map(x=>`<tr><td>${esc(x.place)}</td><td>${x.qty}개</td></tr>`).join("") || `<tr><td colspan=2>없음</td></tr>`)+
+    `</table><div class="title" style="margin-top:12px">남은 돈</div><table>`+
+    (s.claims.map(c=>`<tr><td>${c.kind==="receivable"?"받을 돈":"줄 돈"} · ${esc(c.party_name)}</td><td><button class="link" onclick="openEvent(${c.event_id})">${won(c.amount)}</button></td></tr>`).join("") || `<tr><td colspan=2>없음</td></tr>`)+
+    `</table><div class="row"><button onclick="home()">닫기</button></div></div>`;
+}
+
+// ---------------- 왼쪽: 새 자료
+function home(msg){
+  current = null;
+  $("#left").innerHTML = `<h2>새 자료</h2><div class="card">
+    <div class="meta">스캔 결과(JSON)를 붙여넣거나, 아는 값만 직접 입력하세요. 필요한 확인만 이어서 묻습니다.</div>
+    <textarea id="paste" placeholder='{"input_id": "...", "channel": "scan", ...}'></textarea>
+    <div class="row"><button class="primary" onclick="submitPaste()">접수</button>
+      <span class="meta">예제:</span>
+      <button class="link" onclick="loadEx('scan_normal')">정상 송장</button>
+      <button class="link" onclick="loadEx('scan_issues')">확인 필요한 송장</button>
+      <button class="link" onclick="toggleManual()">직접입력</button></div>
+    <div id="manual" hidden style="margin-top:10px">
+      <div class="row"><input id="m_cust" placeholder="거래처" size="12"><input id="m_doc" placeholder="송장번호(선택)" size="12"><input id="m_date" type="date"></div>
+      <div id="m_lines"></div>
+      <div class="row"><button class="link" onclick="addLine()">+ 품목</button><input id="m_pal" type="number" min="0" placeholder="팔레트(선택)" style="width:110px"><button class="primary" onclick="submitManual()">접수</button></div>
+    </div>
+    <div class="err" id="err">${esc(msg||"")}</div></div>`;
+  addLine();
+}
+function toggleManual(){ const m=$("#manual"); m.hidden=!m.hidden; }
+function addLine(){ const d=document.createElement("div"); d.className="row";
+  d.innerHTML=`<input class="m_item" placeholder="품목" size="16"><input class="m_qty" type="number" min="0" placeholder="수량" style="width:90px">`;
+  $("#m_lines").appendChild(d); }
+function loadEx(k){ const p=JSON.parse(JSON.stringify(examples[k])); p.input_id += "-" + Date.now().toString(36); $("#paste").value = JSON.stringify(p, null, 2); }
+async function submitPaste(){
+  let p; try{ p = JSON.parse($("#paste").value); }catch(e){ $("#err").textContent = "JSON 형식이 아닙니다"; return; }
+  await doIntake(p);
+}
+async function submitManual(){
+  const lines=[...document.querySelectorAll("#m_lines .row")].map(r=>({item:r.querySelector(".m_item").value||null, qty:r.querySelector(".m_qty").value===""?null:Number(r.querySelector(".m_qty").value)})).filter(l=>l.item||l.qty!=null);
+  const pal=$("#m_pal").value;
+  const p={input_id:"manual-"+Date.now().toString(36), channel:"manual", doc_type:"shipment_invoice",
+    customer:$("#m_cust").value||null, doc_no:$("#m_doc").value||null, trade_date:$("#m_date").value||null, lines};
+  if(pal!=="") p.pallets={invoice:Number(pal)};
+  await doIntake(p);
+}
+async function doIntake(p){
+  try{ const r = await api("/api/intake", p); await openEvent(r.event_id, r.outcome==="re_receive"?"이미 기록된 자료입니다. 추가 반영 없이 증빙만 연결했습니다.":""); }
+  catch(e){ $("#err").textContent = e.message; }
+}
+
+// ---------------- 왼쪽: 사건(현재 작업 / 상세)
+async function openEvent(id, note){
+  current = id;
+  const d = await api(`/api/events/${id}`);
+  if(d.status==="merged") return openEvent(d.merged_into, `#${id} 자료는 이 기록에 연결되었습니다.`);
+  const f = d.fields, v = p => f[p] ? f[p].value : null;
+  const lines = Object.keys(f).filter(k=>/^lines\.\d+\.item$/.test(k)).map(k=>+k.split(".")[1]).sort((a,b)=>a-b);
+  const obs = d.obligations.map(o=>`<span class="chip ${o.state}">${o.state==="done"?"✓ ":""}${esc(o.label)}${o.note?": "+esc(o.note):""}</span>`).join("");
+  $("#left").innerHTML = `<div class="row" style="margin:0 0 8px"><button class="link" onclick="home()">← 새 자료</button></div>
+   <div class="card"><div class="title">${esc(d.title)}</div>
+    <div class="meta">거래일 ${esc(d.trade_date||"미확정")} · 전표 ${esc(d.doc_no||"없음")} · 기록 ${esc(d.created_at.replace("T"," ").slice(0,16))}</div>
+    ${note?`<div class="meta" style="color:var(--ok)">${esc(note)}</div>`:""}
+    <div style="margin-top:6px">${obs}</div>
+    ${d.checks.length?`<div style="margin-top:10px"><b>확인할 것 ${d.checks.length}건</b></div>`+d.checks.map(renderCheck).join(""):""}
+    <div class="err" id="err"></div>
+    <details ${d.checks.length?"":"open"}><summary>내용·수정</summary>
+      <table>
+        ${row("거래처",v("customer"),"customer")}${row("현장",v("site"),"site")}
+        ${row("담당자",[v("contact.name"),v("contact.phone")].filter(Boolean).join(" "),"contact.name")}
+        ${lines.map(i=>row(`품목 ${i+1}`, `${v(`lines.${i}.item`)??"?"} × ${v(`lines.${i}.qty`)??"?"} ${v(`lines.${i}.unit`)??""}`, `lines.${i}.qty`, v(`lines.${i}.qty`))).join("")}
+        ${row("팔레트", `${f["pallets.confirmed"]?f["pallets.confirmed"].value+"개 확정":"미확정"} (송장 ${v("pallets.invoice")??"-"} / 메시지 ${v("pallets.message")??"-"})`, "pallets.confirmed", f["pallets.confirmed"]?.value)}
+        ${row("차량 / 기사", [v("vehicle_no"),v("driver_phone")].filter(Boolean).join(" / ")||"-")}
+        ${f["transport.carrier"]?row("운반", `${v("transport.carrier")??"?"} · ${won(v("transport.fee"))}`, "transport.fee", v("transport.fee")):""}
+        ${d.claims.filter(c=>c.state==="active").map(c=>row(c.kind==="receivable"?"받을 돈":"줄 돈", `${esc(c.party_name)} ${won(c.amount)}`)).join("")}
+      </table>
+      <div class="meta" style="margin-top:6px">숫자 옆 <b>수정</b>을 누르면 차이만 다시 반영합니다(이력 보존).</div>
+    </details>
+    <details><summary>원본·처리 이력</summary>
+      ${d.history.map(h=>`<div class="meta">${esc(h.at.replace("T"," ").slice(5,16))} ${esc(h.summary)}</div>`).join("")}
+      ${d.moves.length?`<div class="meta" style="margin-top:6px"><b>가치 이동</b></div>`+d.moves.map(m=>`<div class="meta">${esc(m.created_at.slice(5,16).replace("T"," "))} ${esc(m.item_name)} ${m.qty>0?"":"(조정) "}${m.qty} ${esc(m.unit)} · ${esc(m.from_loc)}→${esc(m.to_loc)} · ${esc(m.reason)}</div>`).join(""):""}
+      ${d.intakes.map(i=>`<details><summary>${esc(i.channel)} ${esc(i.input_id)} · ${esc(i.outcome)} ${i.source_ref?"· "+esc(i.source_ref):""}</summary><pre>${esc(JSON.stringify(JSON.parse(i.payload),null,2))}</pre></details>`).join("")}
+    </details>
+   </div>`;
+  await refreshSide();
+}
+
+function row(label, value, path, raw){
+  const edit = path && ["lines","pallets","transport"].some(p=>path.startsWith(p))
+    ? ` <button class="link" onclick="editVal('${path}', ${JSON.stringify(raw??null)})">수정</button>` : "";
+  return `<tr><td>${esc(label)}</td><td>${esc(value??"-")}${edit}</td></tr>`;
+}
+async function editVal(path, cur){
+  const nv = prompt("새 값", cur ?? ""); if(nv===null) return;
+  try{ await api(`/api/events/${current}/revise`, {changes:{[path]: nv===""?null:Number(nv)}}); await openEvent(current); }
+  catch(e){ $("#err").textContent = e.message; }
+}
+
+function renderCheck(c){
+  const d = c.detail, id = c.id;
+  let body = "";
+  const inp = (val, ph="", type="text") => `<input id="in${id}" type="${type}" value="${esc(val??"")}" placeholder="${esc(ph)}" size="18">`;
+  switch(c.kind){
+    case "verify":
+      body = `<div class="src">원본 판독: <b>${esc(d.raw)}</b> · 추출값: <b>${esc(d.extracted)}</b></div>
+        <div class="row">${d.extracted!=null?`<button class="primary" onclick="ans(${id},{choice:'ok'})">맞음</button>`:""}${inp(d.extracted)}<button onclick="ansVal(${id})">이 값으로</button></div>`; break;
+    case "missing":
+      body = `<div class="row">${inp("", "", c.path.endsWith("qty")?"number":"text")}<button class="primary" onclick="ansVal(${id})">확인</button></div>`; break;
+    case "match":
+      body = `<div class="row">${(d.candidates||[]).map(x=>`<button onclick="ans(${id},{choice:'${x.choice}'})">${esc(x.label)}</button>`).join("")}</div>
+        <div class="row"><span class="meta">새로 등록:</span>${inp(d.input)}${c.path.endsWith(".item")?`<input id="unit${id}" placeholder="단위" size="5">`:""}<button onclick="ansNew(${id})">등록</button></div>`; break;
+    case "contact":
+      body = `<div class="row">${(d.candidates||[]).map((x,i)=>`<button onclick="ans(${id},{choice:'${i}'})">${esc(x.name)} ${esc(x.phone||"")}<span class="meta"> (${esc(x.trade_date||"")})</span></button>`).join("")}
+        ${d.input&&d.input.name?`<button class="primary" onclick="ans(${id},{choice:'keep'})">${esc(d.input.name)} 유지(새 담당자)</button>`:""}</div>
+        <div class="row">${inp("", "이름")}<input id="ph${id}" placeholder="전화" size="14"><button onclick="ans(${id},{value:{name:$('#in${id}').value, phone:$('#ph${id}').value}})">입력</button></div>`; break;
+    case "unit":
+      body = `<div class="row"><button class="primary" onclick="ans(${id},{choice:'item_unit'})">${esc(d.item_unit)}(으)로 본다</button><button onclick="ans(${id},{choice:'keep'})">${esc(d.input)} 유지</button></div>`; break;
+    case "stock":
+      body = `<div class="row"><button class="primary" onclick="ans(${id},{choice:'ok'})">알고 진행</button>${inp("", "수량 수정", "number")}<button onclick="ansVal(${id})">수량 수정</button></div>`; break;
+    case "pallet_mismatch":
+      body = `<div class="row"><button onclick="ans(${id},{choice:'invoice'})">송장 ${d.invoice}개</button><button onclick="ans(${id},{choice:'message'})">상차 메시지 ${d.message}개</button>${inp("", "실제 수량", "number")}<button onclick="ansVal(${id})">입력</button><span class="meta">나중에 해도 제품 출하 반영은 유지됩니다</span></div>`; break;
+    case "pallet_missing":
+      body = `<div class="row">${inp(d.invoice??d.message, "확정 수량", "number")}<button onclick="ansVal(${id})">확정</button><span class="meta">자료가 오면 확정하세요. 그때까지 팔레트 확인 미결</span></div>`; break;
+    case "identity":
+      body = `<div class="src">기존: ${esc(d.other_title)}</div>${(d.diffs||[]).length&&d.mode==="revision_candidate"?`<div class="src">${d.diffs.map(x=>`${esc(x.label)}: ${esc(x.old)} → ${esc(x.new)}`).join(" · ")}</div>`:""}
+        <div class="row"><button class="primary" onclick="ans(${id},{choice:'same'})">${d.mode==="revision_candidate"?"같은 출하 — 차이만 반영":"같은 출하 — 반영 안 함"}</button><button onclick="ans(${id},{choice:'separate'})">별개 출하</button></div>`; break;
+  }
+  return `<div class="check"><div class="q">${esc(c.message)}</div>${c.rule_id?`<div class="flag">${esc(c.rule_id)}</div>`:""}${body}</div>`;
+}
+async function ans(id, a){
+  try{ const r = await api(`/api/events/${current}/answers`, {answers:{[id]:a}}); await openEvent(r.event_id); }
+  catch(e){ $("#err").textContent = e.message; }
+}
+function ansVal(id){ const el=$("#in"+id); const v = el.type==="number" ? (el.value===""?null:Number(el.value)) : el.value; return ans(id,{value:v}); }
+function ansNew(id){ const u=$("#unit"+id); return ans(id,{choice:"new", value:$("#in"+id).value, unit:u?u.value:undefined}); }
+
+(async()=>{ examples = await api("/api/examples"); home(); await refreshSide(); })();
+</script>
+</body>
+</html>

@@ -1,0 +1,51 @@
+{
+  "input_id": "scan-20261112-0003",
+  "channel": "scan",
+  "source_ref": "photos/2026-11-12/invoice_20261112-03.jpg",
+  "doc_type": "shipment_invoice",
+  "doc_no": "20261112-03",
+  "trade_date": "2026-11-12",
+  "customer": "(주)금성백조",
+  "site": "대전광역시 유성구 성북동 731-12",
+  "contact": {
+    "name": "이주형",
+    "phone": "010-0000-0000"
+  },
+  "lines": [
+    {
+      "item": "인터로킹C",
+      "qty": 120,
+      "unit": "m2"
+    },
+    {
+      "item": "보도블럭 A",
+      "qty": 200,
+      "unit": "EA"
+    }
+  ],
+  "pallets": {
+    "invoice": 5,
+    "message": 4,
+    "message_ref": "kakao/2026-11-12/상차-0930"
+  },
+  "vehicle_no": "8123",
+  "driver_phone": "010-1111-2222",
+  "transport": {
+    "carrier": "한빛운수(가상)",
+    "fee": null
+  },
+  "meta": {
+    "vehicle_no": {
+      "handwritten": true,
+      "raw": "8l23"
+    },
+    "driver_phone": {
+      "handwritten": true,
+      "raw": "010-1111-2222"
+    },
+    "lines.1.item": {
+      "uncertain": true,
+      "raw": "보도블럭 A"
+    }
+  }
+}

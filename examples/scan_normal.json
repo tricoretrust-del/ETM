@@ -1,0 +1,47 @@
+{
+  "input_id": "scan-20261111-0001",
+  "channel": "scan",
+  "source_ref": "photos/2026-11-11/invoice_20261111-01.jpg",
+  "doc_type": "shipment_invoice",
+  "doc_no": "20261111-01",
+  "trade_date": "2026-11-11",
+  "customer": "금성백조",
+  "site": "대전광역시 유성구 성북동 731-12",
+  "contact": {
+    "name": "김경섭",
+    "phone": "010-8265-3835"
+  },
+  "lines": [
+    {
+      "item": "보도블록A",
+      "qty": 600,
+      "unit": "EA"
+    },
+    {
+      "item": "경계석 B형(가상)",
+      "qty": 40,
+      "unit": "EA"
+    }
+  ],
+  "pallets": {
+    "invoice": 6,
+    "message": 6,
+    "message_ref": "kakao/2026-11-11/상차-0812"
+  },
+  "vehicle_no": "5006",
+  "driver_phone": "010-5055-5478",
+  "transport": {
+    "carrier": "한빛운수(가상)",
+    "fee": 180000
+  },
+  "meta": {
+    "vehicle_no": {
+      "handwritten": true,
+      "raw": "5006"
+    },
+    "driver_phone": {
+      "handwritten": true,
+      "raw": "010-5055-5478"
+    }
+  }
+}
