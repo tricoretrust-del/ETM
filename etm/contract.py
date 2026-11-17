@@ -10,7 +10,11 @@ import json
 import re
 from datetime import date
 
-DOC_TYPES = {"shipment_invoice": "shipment_invoice", "출하송장": "shipment_invoice", "송장": "shipment_invoice"}
+DOC_TYPES = {"shipment_invoice": "shipment_invoice", "출하송장": "shipment_invoice", "송장": "shipment_invoice",
+             "receipt": "receipt", "입고전표": "receipt", "statement": "statement", "거래명세서": "statement"}
+# 현재 처리(재고·돈 반영)는 출하 송장만. 나머지는 원본·변환값을 보관만 한다.
+PROCESSED_DOC_TYPES = {"shipment_invoice"}
+DOC_LABEL = {"shipment_invoice": "출하송장", "receipt": "입고전표", "statement": "거래명세서"}
 CHANNELS = {"scan", "manual"}
 
 # 숫자로 계산하지 않고 문자열로만 다루는 필드
@@ -85,7 +89,7 @@ def normalize(payload: dict) -> tuple[dict, dict]:
         errors.append("channel: scan 또는 manual")
     doc_type = DOC_TYPES.get(payload.get("doc_type") or "shipment_invoice")
     if not doc_type:
-        errors.append("doc_type: 현재는 shipment_invoice(출하송장)만 지원")
+        errors.append("doc_type: shipment_invoice(출하송장) | receipt(입고전표) | statement(거래명세서)")
 
     trade_date = payload.get("trade_date")
     if trade_date is not None:
@@ -105,6 +109,8 @@ def normalize(payload: dict) -> tuple[dict, dict]:
     put("trade_date", trade_date)
     put("customer", _str_or_none(payload.get("customer"), "customer", errors, meta))
     put("site", _str_or_none(payload.get("site"), "site", errors, meta))
+    put("supplier", _str_or_none(payload.get("supplier"), "supplier", errors, meta))     # 보낸 업체(입고)
+    put("receiver", _str_or_none(payload.get("receiver"), "receiver", errors, meta))     # 받은 곳(입고)
     contact = payload.get("contact") or {}
     put("contact.name", _str_or_none(contact.get("name"), "contact.name", errors, meta))
     put("contact.phone", _str_or_none(contact.get("phone"), "contact.phone", errors, meta))

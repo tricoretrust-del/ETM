@@ -19,7 +19,38 @@ INVOICE_TEXT = """송장번호: 20261111-01
 """
 
 
+RECEIPT_TEXT = """1. 업체명: (사진에 안나옴, 다음부터는 제대로 나오게 사진을 찍을 것) LOGISALL
+2. 전표번호: A14884069
+3. 입고일: 2026-11-11
+4. 납품처: 주식회사 지오블록
+5. 차량번호: 885968
+6. 기사연락처: 01071550855
+7. 유형: P10
+8. 수량: 97"""
+
+
 class TestTextParse(unittest.TestCase):
+    def test_receipt_is_held_not_shipped(self):
+        p, _ = textparse.to_payload(RECEIPT_TEXT)
+        self.assertEqual(p["doc_type"], "receipt")
+        self.assertEqual(p["supplier"], "LOGISALL")            # 업체명 = 보낸 업체
+        self.assertEqual(p["receiver"], "주식회사 지오블록")      # 납품처 = 받은 곳 (거래처 아님)
+        self.assertNotIn("customer", p)
+        self.assertEqual(p["trade_date"], "2026-11-11")
+        self.assertEqual(p["driver_phone"], "010-7155-0855")
+        self.assertEqual(p["lines"], [{"item": "P10", "qty": 97, "unit": None}])
+        conn = db.connect(":memory:")
+        seed.seed_demo(conn)
+        before = process.summary(conn)
+        r = process.intake(conn, p)
+        self.assertEqual(r["outcome"], "held")
+        self.assertEqual(process.summary(conn), before)          # 재고·돈 변화 없음
+        self.assertEqual(process.intake(conn, p)["outcome"], "re_receive")
+
+    def test_code_like_item_not_split(self):
+        p, _ = textparse.to_payload("품명: SDC08\n발주수량: 18\n단위: 백")
+        self.assertEqual(p["lines"], [{"item": "SDC08", "qty": 18, "unit": "백"}])
+
     def test_labeled_text(self):
         p, _ = textparse.to_payload(INVOICE_TEXT)
         self.assertEqual(p["doc_no"], "20261111-01")

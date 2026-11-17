@@ -159,7 +159,9 @@ async function openEvent(id, note){
   current = id;
   const d = await api(`/api/events/${id}`);
   if(d.status==="merged") return openEvent(d.merged_into, `#${id} 자료는 이 기록에 연결되었습니다.`);
+  if(d.status==="held") note = [note, "이 문서 종류는 아직 처리 기능이 없어 원본과 변환 결과만 보관했습니다. 재고·돈에는 반영하지 않았습니다."].filter(Boolean).join("\n");
   const f = d.fields, v = p => f[p] ? f[p].value : null;
+  readOnly = d.status !== "active";
   const lines = Object.keys(f).filter(k=>/^lines\.\d+\.item$/.test(k)).map(k=>+k.split(".")[1]).sort((a,b)=>a-b);
   const obs = d.obligations.map(o=>`<span class="chip ${o.state}">${o.state==="done"?"✓ ":""}${esc(o.label)}${o.note?": "+esc(o.note):""}</span>`).join("");
   $("#left").innerHTML = `<div class="row" style="margin:0 0 8px"><button class="link" onclick="home()">← 새 자료</button></div>
@@ -171,15 +173,15 @@ async function openEvent(id, note){
     <div class="err" id="err"></div>
     <details ${d.checks.length?"":"open"}><summary>내용·수정</summary>
       <table>
-        ${row("거래처",v("customer"),"customer")}${row("현장",v("site"),"site")}
+        ${readOnly ? row("보낸 업체",v("supplier"))+row("받은 곳",v("receiver")) : row("거래처",v("customer"),"customer")+row("현장",v("site"),"site")}
         ${row("담당자",[v("contact.name"),v("contact.phone")].filter(Boolean).join(" "),"contact.name")}
         ${lines.map(i=>row(`품목 ${i+1}`, `${v(`lines.${i}.item`)??"?"} × ${v(`lines.${i}.qty`)??"?"} ${v(`lines.${i}.unit`)??""}`, `lines.${i}.qty`, v(`lines.${i}.qty`))).join("")}
-        ${row("팔레트", `${f["pallets.confirmed"]?f["pallets.confirmed"].value+"개 확정":"미확정"} (송장 ${v("pallets.invoice")??"-"} / 메시지 ${v("pallets.message")??"-"})`, "pallets.confirmed", f["pallets.confirmed"]?.value)}
+        ${readOnly?"":row("팔레트", `${f["pallets.confirmed"]?f["pallets.confirmed"].value+"개 확정":"미확정"} (송장 ${v("pallets.invoice")??"-"} / 메시지 ${v("pallets.message")??"-"})`, "pallets.confirmed", f["pallets.confirmed"]?.value)}
         ${row("차량 / 기사", [v("vehicle_no"),v("driver_phone")].filter(Boolean).join(" / ")||"-")}
         ${f["transport.carrier"]?row("운반", `${v("transport.carrier")??"?"} · ${won(v("transport.fee"))}`, "transport.fee", v("transport.fee")):""}
         ${d.claims.filter(c=>c.state==="active").map(c=>row(c.kind==="receivable"?"받을 돈":"줄 돈", `${esc(c.party_name)} ${won(c.amount)}`)).join("")}
       </table>
-      <div class="meta" style="margin-top:6px">숫자 옆 <b>수정</b>을 누르면 차이만 다시 반영합니다(이력 보존).</div>
+      ${readOnly?"":`<div class="meta" style="margin-top:6px">숫자 옆 <b>수정</b>을 누르면 차이만 다시 반영합니다(이력 보존).</div>`}
     </details>
     <details><summary>원본·처리 이력</summary>
       ${d.history.map(h=>`<div class="meta">${esc(h.at.replace("T"," ").slice(5,16))} ${esc(h.summary)}</div>`).join("")}
@@ -190,8 +192,9 @@ async function openEvent(id, note){
   await refreshSide();
 }
 
+let readOnly = false;   // 보관만 한 문서는 수정 버튼을 숨긴다
 function row(label, value, path, raw){
-  const edit = path && ["lines","pallets","transport"].some(p=>path.startsWith(p))
+  const edit = !readOnly && path && ["lines","pallets","transport"].some(p=>path.startsWith(p))
     ? ` <button class="link" onclick="editVal('${path}', ${JSON.stringify(raw??null)})">수정</button>` : "";
   return `<tr><td>${esc(label)}</td><td>${esc(value??"-")}${edit}</td></tr>`;
 }

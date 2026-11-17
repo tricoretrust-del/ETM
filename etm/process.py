@@ -543,6 +543,12 @@ def item_name(conn, item_id):
 
 def event_title(conn, event_id) -> str:
     ev, f = load_event(conn, event_id)
+    if ev["kind"] != "shipment":
+        who = " → ".join(x for x in ((f.get("supplier") or {}).get("value"), (f.get("receiver") or {}).get("value"),
+                                     ) if x) or f["customer"]["value"] or "업체 미확정"
+        items = ", ".join(f"{f[f'lines.{i}.item']['value'] or '품목?'} {_fmt_qty(f[f'lines.{i}.qty']['value'])}"
+                          for i in line_indexes(f))
+        return f"{contract.DOC_LABEL.get(ev['doc_type'], ev['doc_type'])} {who}" + (f" · {items}" if items else "")
     cust = f["customer"]["value"] or "거래처 미확정"
     parts = []
     for i in line_indexes(f):
@@ -591,7 +597,7 @@ def intake(conn, payload: dict) -> dict:
         # (a) 같은 내용 재수신 → 기존 사건에 증빙만 연결, 추가 반영 없음
         same = conn.execute(
             "SELECT i.event_id FROM intake i JOIN event e ON e.id=i.event_id"
-            " WHERE i.payload_hash=? AND e.status='active' ORDER BY i.id LIMIT 1", (h,)).fetchone()
+            " WHERE i.payload_hash=? AND e.status IN ('active','held') ORDER BY i.id LIMIT 1", (h,)).fetchone()
         if same:
             ev_id = same["event_id"]
             conn.execute("INSERT INTO intake(input_id, channel, source_ref, received_at, payload, payload_hash, event_id, outcome)"
@@ -599,6 +605,20 @@ def intake(conn, payload: dict) -> dict:
                          (header["input_id"], header["channel"], header["source_ref"], now(), jdump(payload), h, ev_id))
             log(conn, ev_id, "re_receive", f"재수신 — 이미 기록된 {event_title(conn, ev_id)} · 추가 반영 없음")
             return {"event_id": ev_id, "outcome": "re_receive", "checks": _checks_out(conn, ev_id)}
+
+        if header["doc_type"] not in contract.PROCESSED_DOC_TYPES:
+            # 아직 처리 규칙이 없는 문서: 거부하지 않고 원본·변환값만 보관한다. 재고·돈 반영 없음.
+            t = now()
+            ev_id = conn.execute(
+                "INSERT INTO event(kind, doc_type, doc_no, trade_date, created_at, updated_at, status, fields)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'held', ?)",
+                (header["doc_type"], header["doc_type"], fields["doc_no"]["value"], fields["trade_date"]["value"],
+                 t, t, jdump(fields))).lastrowid
+            conn.execute("INSERT INTO intake(input_id, channel, source_ref, received_at, payload, payload_hash, event_id, outcome)"
+                         " VALUES (?,?,?,?,?,?,?,'held')",
+                         (header["input_id"], header["channel"], header["source_ref"], t, jdump(payload), h, ev_id))
+            log(conn, ev_id, "hold", f"{event_title(conn, ev_id)} · 보관만 함(처리 기능 준비 중, 재고·돈 반영 없음)")
+            return {"event_id": ev_id, "outcome": "held", "checks": []}
 
         if header.get("price_ref"):
             fields["_price_ref"] = header["price_ref"]

@@ -19,6 +19,11 @@ import re
 from datetime import date
 
 # 항목 이름(공백 제거·소문자) → 입력 계약 경로. 앞에 있는 것이 우선.
+# 입고전표에서는 '업체명'이 보낸 업체, '납품처'가 받은 곳이다(출하와 반대). 먼저 확인한다.
+RECEIPT_KEYS: list[tuple[str, str]] = [
+    (r"(업체명|공급자|공급업체|보낸곳|발송처|출고처)", "supplier"),
+    (r"(납품처|받는곳|입고처|인수처)", "receiver"),
+]
 KEYS: list[tuple[str, str]] = [
     (r"(상차|메시지|메세지|카톡).*(팔레트|파렛트|빠레트|plt)", "pallets.message"),
     (r"(팔레트|파렛트|빠레트|plt)", "pallets.invoice"),
@@ -28,12 +33,12 @@ KEYS: list[tuple[str, str]] = [
     (r"(차량|차번|차량번호)", "vehicle_no"),
     (r"(담당자|인수자|받는분|소장)", "contact.name"),
     (r"(송장|전표|문서)(번호|no)?|^no$|^번호$", "doc_no"),
-    (r"(납품일|출하일|거래일|일자|날짜|date)", "trade_date"),
+    (r"(납품일|출하일|입고일|거래일|일자|날짜|date)", "trade_date"),
     (r"(공급받는자|거래처|납품처|고객|업체|customer)", "customer"),
     (r"(현장|주소|납품장소|site)", "site"),
     (r"(운송사|운송업체|운반업체|carrier)", "transport.carrier"),
     (r"(운반비|운송비|운임|freight)", "transport.fee"),
-    (r"(품목|제품|품명|상품|item)\d*", "line.item"),
+    (r"(품목|제품|품명|상품|유형|규격|타입|종류|item)\d*", "line.item"),
     (r"(수량|qty)", "line.qty"),
     (r"(단위|unit)", "line.unit"),
 ]
@@ -44,7 +49,8 @@ DATE_RE = re.compile(r"(20\d{2})\s*[-./년]\s*(\d{1,2})\s*[-./월]\s*(\d{1,2})\s
 SHORT_DATE_RE = re.compile(r"(?<!\d)(\d{1,2})\s*월\s*(\d{1,2})\s*일")
 PHONE_RE = re.compile(r"(?<!\d)(01[016789])[-.\s]?(\d{3,4})[-.\s]?(\d{4})(?!\d)")
 DOCNO_RE = re.compile(r"(?<!\d)(20\d{6}-\d{1,3})(?!\d)")
-LINE_RE = re.compile(r"^(?P<name>.*?\S)\s*[x×*]?\s*(?P<qty>\d[\d,]*(?:\.\d+)?)\s*(?P<unit>[A-Za-z가-힣㎡]{0,4}\d?)\s*$")
+# 이름과 수량 사이에는 공백이나 x·× 가 있어야 한다. 'P10', 'SDC08' 같은 코드는 쪼개지 않는다.
+LINE_RE = re.compile(r"^(?P<name>.*?\S)(?:\s+|\s*[x×*]\s*)(?P<qty>\d[\d,]*(?:\.\d+)?)\s*(?P<unit>[A-Za-z가-힣㎡]{0,4}\d?)\s*$")
 
 
 def to_payload(text: str, known_customers: list[str] | None = None) -> tuple[dict, list[str]]:
@@ -77,7 +83,8 @@ def _loose_json(text: str) -> dict | None:
 
 # --------------------------------------------------------------------------- 2) 항목: 값 텍스트
 def _from_text(text: str, known_customers: list[str]) -> tuple[dict, list[str]]:
-    p: dict = {"channel": "manual", "doc_type": "shipment_invoice", "raw_text": text}
+    doc_type = _doc_type(text)
+    p: dict = {"channel": "manual", "doc_type": doc_type, "raw_text": text}
     meta: dict[str, dict] = {}
     notes: list[str] = []
     lines: list[dict] = []
@@ -106,7 +113,7 @@ def _from_text(text: str, known_customers: list[str]) -> tuple[dict, list[str]]:
         if not m:
             # 콜론 없이 "기사 010-…", "팔레트 6" 처럼 쓴 경우: 첫 낱말이 항목 이름이면 받아들인다
             m = re.match(r"^(?P<k>\S{1,10})\s+(?P<v>.+)$", line)
-            if not m or _path_for(m["k"]) is None:
+            if not m or _path_for(m["k"], doc_type) is None:
                 unknown.append(line)
                 continue
         key, val = m["k"].strip(), m["v"].strip()
@@ -119,7 +126,7 @@ def _from_text(text: str, known_customers: list[str]) -> tuple[dict, list[str]]:
         hand = "손글씨" in note or "수기" in note or "수기" in val
         unsure = any(w in note for w in ("불확실", "확인필요", "확인 필요", "?")) or val.endswith("?")
         val = val.rstrip("?").strip()
-        path = _path_for(key)
+        path = _path_for(key, doc_type)
         if path is None:
             unknown.append(line)
             continue
@@ -217,9 +224,18 @@ def _is_note(x: str) -> bool:
     return any(w in x for w in NOTE_WORDS) or (" " in x.strip() and len(x) > 6)
 
 
-def _path_for(key: str) -> str | None:
+def _doc_type(text: str) -> str:
+    keys = " ".join(re.findall(r"^\s*(?:[-*•·]|\d+[.)])?\s*([^:：=\n]{1,20})\s*[:：=]", text, re.M))
+    if "입고" in keys or "입고전표" in text:
+        return "receipt"
+    if "거래명세서" in text:
+        return "statement"
+    return "shipment_invoice"
+
+
+def _path_for(key: str, doc_type: str = "shipment_invoice") -> str | None:
     k = re.sub(r"\s", "", key).lower()
-    for pat, path in KEYS:
+    for pat, path in (RECEIPT_KEYS + KEYS if doc_type == "receipt" else KEYS):
         if re.search(pat, k):
             return path
     return None
