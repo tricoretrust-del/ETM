@@ -111,8 +111,8 @@ function showStock(){
 function home(msg){
   current = null;
   $("#left").innerHTML = `<h2>새 자료</h2><div class="card">
-    <div class="meta">스캔 결과(JSON)를 붙여넣거나, 아는 값만 직접 입력하세요. 필요한 확인만 이어서 묻습니다.</div>
-    <textarea id="paste" placeholder='{"input_id": "...", "channel": "scan", ...}'></textarea>
+    <div class="meta">스캔 결과·메시지·메모를 그대로 붙여넣으세요(JSON 아니어도 됨). 필요한 확인만 이어서 묻습니다.</div>
+    <textarea id="paste" placeholder="송장번호: 20261111-01&#10;납품일: 2026-11-11&#10;공급받는자: 금성백조&#10;품목1: 보도블록A 600 EA&#10;팔레트: 6&#10;차량번호: 5006 (손글씨)"></textarea>
     <div class="row"><button class="primary" onclick="submitPaste()">접수</button>
       <span class="meta">예제:</span>
       <button class="link" onclick="loadEx('scan_normal')">정상 송장</button>
@@ -132,7 +132,8 @@ function addLine(){ const d=document.createElement("div"); d.className="row";
   $("#m_lines").appendChild(d); }
 function loadEx(k){ const p=JSON.parse(JSON.stringify(examples[k])); p.input_id += "-" + Date.now().toString(36); $("#paste").value = JSON.stringify(p, null, 2); }
 async function submitPaste(){
-  let p; try{ p = JSON.parse($("#paste").value); }catch(e){ $("#err").textContent = "JSON 형식이 아닙니다"; return; }
+  const raw = $("#paste").value;
+  let p; try{ p = JSON.parse(raw); }catch(e){ p = {text: raw}; }   // JSON 이 아니면 서버에서 자동 변환
   await doIntake(p);
 }
 async function submitManual(){
@@ -144,7 +145,12 @@ async function submitManual(){
   await doIntake(p);
 }
 async function doIntake(p){
-  try{ const r = await api("/api/intake", p); await openEvent(r.event_id, r.outcome==="re_receive"?"이미 기록된 자료입니다. 추가 반영 없이 증빙만 연결했습니다.":""); }
+  try{
+    const r = await api("/api/intake", p);
+    const msg = [r.outcome==="re_receive"?"이미 기록된 자료입니다. 추가 반영 없이 증빙만 연결했습니다.":"",
+                 r.converted?"입력 내용을 자동으로 변환했습니다.":"", ...(r.notes||[])].filter(Boolean).join("\n");
+    await openEvent(r.event_id, msg);
+  }
   catch(e){ $("#err").textContent = e.message; }
 }
 
@@ -159,7 +165,7 @@ async function openEvent(id, note){
   $("#left").innerHTML = `<div class="row" style="margin:0 0 8px"><button class="link" onclick="home()">← 새 자료</button></div>
    <div class="card"><div class="title">${esc(d.title)}</div>
     <div class="meta">거래일 ${esc(d.trade_date||"미확정")} · 전표 ${esc(d.doc_no||"없음")} · 기록 ${esc(d.created_at.replace("T"," ").slice(0,16))}</div>
-    ${note?`<div class="meta" style="color:var(--ok)">${esc(note)}</div>`:""}
+    ${note?`<div class="meta" style="color:var(--ok);white-space:pre-wrap">${esc(note)}</div>`:""}
     <div style="margin-top:6px">${obs}</div>
     ${d.checks.length?`<div style="margin-top:10px"><b>확인할 것 ${d.checks.length}건</b></div>`+d.checks.map(renderCheck).join(""):""}
     <div class="err" id="err"></div>

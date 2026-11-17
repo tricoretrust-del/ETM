@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import contract, db, process, seed
+from . import contract, db, process, seed, textparse
 
 STATIC = Path(__file__).parent / "static"
 
@@ -34,7 +34,18 @@ class App:
             if method == "GET" and m:
                 return 200, process.event_detail(c, int(m[1]))
             if method == "POST" and path == "/api/intake":
-                return 200, process.intake(c, body or {})
+                body = body or {}
+                notes: list[str] = []
+                if "text" in body and "input_id" not in body:
+                    # JSON 이 아닌 입력: 입력 계약 형식으로 자동 변환 후 접수
+                    names = []
+                    for r in c.execute("SELECT name, aliases FROM party WHERE kind='customer'"):
+                        names += [r["name"], *json.loads(r["aliases"] or "[]")]
+                    body, notes = textparse.to_payload(body["text"], names)
+                res = process.intake(c, body)
+                res["converted"] = bool(notes) or "raw_text" in body
+                res["notes"] = notes
+                return 200, res
             m = re.fullmatch(r"/api/events/(\d+)/answers", path)
             if method == "POST" and m:
                 return 200, process.answer(c, int(m[1]), (body or {}).get("answers", {}))
