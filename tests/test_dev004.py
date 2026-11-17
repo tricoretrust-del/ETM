@@ -25,8 +25,9 @@ RETURN = """반납전표
 수량: 20"""
 
 
-def line(text="P10", qty=97, ref=None, src="document", unit=None):
-    return {"item_text": text, "item_ref": ref, "item_source": src, "qty": qty, "unit": unit}
+def line(text="P10", qty=97, ref=None, src="document", unit=None, owner=None, osrc="none"):
+    return {"item_text": text, "item_ref": ref, "item_source": src, "qty": qty, "unit": unit,
+            "owner_ref": owner, "owner_source": osrc}
 
 
 def resp(*, status="ready_for_validation", action="receipt_record", kind_source="document", kind_refs=(),
@@ -39,7 +40,7 @@ def resp(*, status="ready_for_validation", action="receipt_record", kind_source=
     return {"status": status, "document_hypothesis": {"kind": hyp, "description": "시험", "basis": "fixture"},
             "answer_interpretation": interp, "field_proposals": [], "missing_or_conflicting_fields": [],
             "next_question": question, "processing_proposal": pp, "evidence_refs": [],
-            "learning_candidates": list(cands)}
+            "learning_candidates": [{"target_ref": None, "alias": None, **c} for c in cands]}
 
 
 def q(qid="q1", target="kind", text="이 자료는 무엇인가요?", options=("입고", "출하"), reason="unknown_meaning"):

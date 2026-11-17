@@ -290,6 +290,8 @@ def _all_refs(resp) -> list[str]:
     pp = resp.get("processing_proposal") or {}
     refs += pp.get("kind_refs") or []
     refs += [ln["item_ref"] for ln in pp.get("lines") or [] if ln.get("item_ref")]
+    refs += [ln["owner_ref"] for ln in pp.get("lines") or [] if ln.get("owner_ref") and ln["owner_ref"] != "own"]
+    refs += [c["target_ref"] for c in resp.get("learning_candidates") or [] if c.get("target_ref")]
     return refs
 
 
@@ -310,9 +312,18 @@ def _process_response(conn, d, resp, request_id):
         conn.execute("UPDATE dialog_answer SET interpretation=? WHERE id=?", (jdump(ai), last_a["id"]))
     for c in resp.get("learning_candidates") or []:
         explicit = bool(c.get("explicit_user_instruction")) and bool(ai and ai.get("generalize")) and last_a is not None
+        payload = None
+        if c["kind"] == "alias":
+            # 기준정보 별칭: 사용자가 이번 문답에서 직접 말한 사실만. 별칭 글자가 사용자 답에 그대로 있어야 한다
+            if last_a is None or not c.get("alias") or not str(c.get("target_ref") or "").startswith("item:") \
+                    or norm(c["alias"]) not in norm(last_a["raw_text"]):
+                continue
+            payload = jdump({"target_ref": c["target_ref"], "alias": c["alias"].strip()})
+            explicit = True
         conn.execute("INSERT INTO learning_candidate(dialog_id, kind, text, scope, explicit_instruction, answer_id, status,"
-                     " created_at) VALUES (?,?,?,?,?,?, 'suggested', ?)",
-                     (did, c["kind"], c["text"], c.get("scope") or "", int(explicit), last_a["id"] if explicit else None, now()))
+                     " created_at, payload) VALUES (?,?,?,?,?,?, 'suggested', ?, ?)",
+                     (did, c["kind"], c["text"], c.get("scope") or "", int(explicit),
+                      last_a["id"] if explicit else None, now(), payload))
     pp = resp["processing_proposal"]
     # 사용자 답으로 종류가 확정된 경우(API 해석) — 원문 답변이 있어야만 인정
     kind = ACTION_TO_KIND.get(pp["action"])
@@ -332,6 +343,14 @@ def _process_response(conn, d, resp, request_id):
             ref = ln.get("item_ref")
             answered_this = conn.execute("SELECT 1 FROM dialog_question WHERE id=? AND target=?",
                                          (last_a["question_id"], f"lines.{i}.item")).fetchone()
+            oref = ln.get("owner_ref")
+            owner_q = conn.execute("SELECT 1 FROM dialog_question WHERE id=? AND target=?",
+                                   (last_a["question_id"], f"lines.{i}.owner")).fetchone()
+            if oref and (ln.get("owner_source") == "user_answer" or owner_q) and str(i) not in state.get("owners", {}):
+                lab = "자사" if oref == "own" else conn.execute("SELECT name FROM party WHERE id=?",
+                                                               (int(oref.split(":")[1]),)).fetchone()["name"]
+                state.setdefault("owners", {})[str(i)] = {"value": oref, "label": lab, "source": "user_answer",
+                                                          "answer_id": last_a["id"], "via": "api_interpretation"}
             if ref and (ln.get("item_source") == "user_answer" or answered_this) and str(i) not in state.get("items", {}):
                 state.setdefault("items", {})[str(i)] = {"choice": ref, "source": "user_answer", "answer_id": last_a["id"],
                                                           "via": "api_interpretation"}
@@ -383,6 +402,13 @@ def _kind_known(conn, d, pp, state):
     if rk and "value" in rk:   # 승인된 규칙의 조건 범위 안 → 재사용 처리 근거
         return rk
     kind = ACTION_TO_KIND.get(pp["action"])
+    marks = {k for w, k in learn.MARKER_KIND.items() if w in d["raw_input"]}
+    if len(marks) == 1 and pp["action"] in ("none", "receipt_record", "shipment_apply") \
+            and (kind is None or kind in marks):
+        # 원문 종류 표기가 한 방향뿐이고 모델 제안과 어긋나지 않음 → 서버가 원문 근거로 확정(모델이 '모름'이어도)
+        mk = next(iter(marks))
+        if mk in ("receipt", "shipment"):
+            return {"value": mk, "source": "document"}
     if not kind:
         return None
     src = pp["kind_source"]
@@ -612,6 +638,18 @@ def _owner_known(conn, d, pp, ln, i, state, ik):
     return None
 
 
+def _is_name_answer(conn, q, choice, val, loose=True) -> bool:
+    """이름(업체)으로 바로 받아도 되는 답인가: 버튼 선택, 제시한 선택지, 알려진 업체명·별칭, 또는 한 단어."""
+    if choice or val in json.loads(q["options"] or "[]") or val == "자사":
+        return True
+    n = norm(val)
+    for r in conn.execute("SELECT name, aliases FROM party"):
+        if n in [norm(x) for x in [r["name"], *json.loads(r["aliases"] or "[]")] if x]:
+            return True
+    # 상대 업체 칸만: 공백 없는 짧은 이름(예: LOGISALL). 소유자 칸은 거래 상대를 새로 만들 수 있어 더 엄격하게
+    return loose and bool(re.fullmatch(r"[\w().&-]{1,30}", val.strip()))
+
+
 def _resolve_server_answer(conn, q, choice, text, state, aid) -> bool:
     """서버 확인 질문에 대한 선택·'맞음'을 결정적으로 반영. 처리했으면 True."""
     if q["origin"] != "server":
@@ -620,6 +658,8 @@ def _resolve_server_answer(conn, q, choice, text, state, aid) -> bool:
     if q["target"] == "counterparty":
         if q["proposed"] and (YES.match(val) or YES_PREFIX.match(val)):
             val = q["proposed"]
+        elif not _is_name_answer(conn, q, choice, val):
+            return False   # 문장으로 답함 → 해석(API)
         if val:
             state["counterparty"] = {"value": val, "source": "user_answer", "answer_id": aid}
             return True
@@ -647,6 +687,8 @@ def _resolve_server_answer(conn, q, choice, text, state, aid) -> bool:
             return True
         return False
     m = re.fullmatch(r"lines\.(\d+)\.owner", q["target"])
+    if m and val and not _is_name_answer(conn, q, choice, val, loose=False):
+        return False   # 문장으로 답함 → 이름으로 저장하지 않고 해석(API)에 넘긴다
     if m and val:
         if val == "자사":
             owner, label = "own", "자사"
@@ -830,6 +872,25 @@ def accept_candidate(conn, *, candidate_id: int, actor: str) -> dict:
             raise Conflict("수락할 수 있는 후보가 아닙니다")
         d = _dialog(conn, c["dialog_id"])
         result = {}
+        if c["kind"] == "alias":
+            # 기준정보 별칭 추가: 조건 없는 사실이므로 업체 범위 규칙이 아니라 기준정보를 고친다(승인권자만, 기록 남김)
+            if u["role"] not in learn.ROLE_CAN_APPROVE:
+                raise Forbidden("기준정보 변경은 승인권자만 할 수 있습니다")
+            pl = json.loads(c["payload"] or "{}")
+            iid = int(pl["target_ref"].split(":")[1])
+            it = conn.execute("SELECT * FROM item WHERE id=?", (iid,)).fetchone()
+            if not it:
+                raise Conflict("없는 품목입니다")
+            aliases = json.loads(it["aliases"] or "[]")
+            if norm(pl["alias"]) not in [norm(x) for x in [it["name"], it["code"] or "", *aliases] if x]:
+                aliases.append(pl["alias"])
+                conn.execute("UPDATE item SET aliases=? WHERE id=?", (jdump(aliases), iid))
+            ans = conn.execute("SELECT raw_text FROM dialog_answer WHERE id=?", (c["answer_id"],)).fetchone()
+            process.log(conn, d["event_id"], "master",
+                        f"기준정보 별칭 추가: '{pl['alias']}' → {it['name']} (문답 #{d['id']} 답변: {ans['raw_text'] if ans else ''})")
+            result, linked = {"item_id": iid, "alias": pl["alias"]}, f"item:{iid}#alias"
+            conn.execute("UPDATE learning_candidate SET status='accepted', linked=? WHERE id=?", (linked, candidate_id))
+            return result
         if c["kind"] == "rbk":
             if not c["explicit_instruction"]:
                 raise Conflict("사용자의 명시적 일반화 지시가 없는 규칙 후보는 LAG 로 등록해 검증하세요")

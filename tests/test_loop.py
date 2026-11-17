@@ -105,6 +105,7 @@ class Migration0007(Base):
                            " VALUES (1, 'item_map', 'logisall|p10', 'x', '{}', 'owner', 't')")
             self.c.execute("INSERT INTO decision_case(event_id, decision_kind, decision_key, label, answer, actor, at)"
                            " VALUES (1, 'doc_kind', '수량·업체명', 'x', '\"other\"', 'owner', 't')")
+            self.c.execute("ALTER TABLE learning_candidate DROP COLUMN payload")   # 0008 이전 상태로 되돌림
             self.c.execute("PRAGMA user_version = 6")
         self.c.close()
         self.c = db.connect(path)
@@ -250,3 +251,61 @@ class Concurrency(Base):
         self.assertEqual(out["r"][1]["open_question"]["target"], "lines.0.item")
         n = self.c.execute("SELECT COUNT(*) FROM llm_call WHERE dialog_id=?", (did,)).fetchone()[0]
         self.assertEqual(n, 1)
+
+
+class SentenceAnswer(Base):
+    """'P10은 KPP 팔레트의 모델명이고 이 전표는 LOGISALL이 지오블록의 하차담당자에게 전달한 거야'"""
+    A = "P10은 KPP 팔레트의 모델명이고 이 전표는 LOGISALL이 지오블록의 하차담당자에게 전달한 거야"
+
+    def test_sentence_to_owner_question_is_interpreted_not_stored_as_name(self):
+        from tests.test_dev004 import J01
+        kpp_party = self.c.execute("SELECT id FROM party WHERE name='KPP'").fetchone()[0]
+        n_party = self.c.execute("SELECT COUNT(*) FROM party").fetchone()[0]
+        self.queue = [resp()]
+        d = dialog.analyze_input(self.c, text=J01, actor="owner")
+        d = self.answer(d, choice="KPP 팔레트")
+        self.assertEqual(d["open_question"]["target"], "lines.0.owner")
+        self.queue = [resp(lines=[line(ref=f"item:{self.kpp()}", src="user_answer",
+                                       owner=f"party:{kpp_party}", osrc="user_answer")])]
+        d = self.answer(d, text=self.A)
+        self.assertEqual(d["status"], "applied")
+        self.assertEqual(self.c.execute("SELECT COUNT(*) FROM party").fetchone()[0], n_party, "문장이 업체로 등록됨")
+        mv = self.c.execute("SELECT owner FROM value_move WHERE event_id=?", (d["event_id"],)).fetchone()
+        self.assertEqual(mv["owner"], f"party:{kpp_party}")
+
+    def test_alias_candidate_then_master_exact(self):
+        from tests.test_dev004 import J01
+        kpp = self.kpp()
+        kpp_party = self.c.execute("SELECT id FROM party WHERE name='KPP'").fetchone()[0]
+        self.queue = [resp(),
+                      resp(lines=[line(ref=f"item:{kpp}", src="user_answer", owner=f"party:{kpp_party}",
+                                       osrc="user_answer")],
+                           cands=[{"kind": "alias", "text": "P10 은 KPP 팔레트의 모델명", "scope": "",
+                                   "explicit_user_instruction": False, "target_ref": f"item:{kpp}", "alias": "P10"},
+                                  {"kind": "alias", "text": "지어낸 별칭", "scope": "",
+                                   "explicit_user_instruction": False, "target_ref": f"item:{kpp}", "alias": "Z99"}])]
+        d = dialog.analyze_input(self.c, text=J01, actor="owner")
+        d = self.answer(d, text=self.A)          # 품목 질문에 문장으로 답함
+        self.assertEqual(d["status"], "applied")
+        al = [c for c in d["candidates"] if c["kind"] == "alias"]
+        self.assertEqual(len(al), 1, "답변에 없는 별칭(Z99)은 후보가 되면 안 됨")
+        with self.assertRaises(learn.Forbidden):
+            dialog.accept_candidate(self.c, candidate_id=al[0]["id"], actor="staff")
+        dialog.accept_candidate(self.c, candidate_id=al[0]["id"], actor="owner")
+        # 다음 자료: P10 은 기준정보 정확 일치 → 품목 질문 없음(업체와 무관)
+        self.queue = [resp(counterparty="다른업체", lines=[line(qty=5)])]
+        d2 = dialog.analyze_input(self.c, text="다른업체 입고전표\n유형: P10\n수량: 5", actor="owner")
+        self.assertNotEqual((d2["open_question"] or {}).get("target"), "lines.0.item")
+
+
+class DocumentMarkerByServer(Base):
+    def test_marker_confirms_kind_even_if_model_unsure(self):
+        self.queue = [resp(action="none", kind_source="none", hyp="unknown", lines=[line(qty=5)])]
+        d = dialog.analyze_input(self.c, text="LOGISALL 입고전표\n유형: P10\n수량: 5", actor="owner")
+        self.assertNotEqual((d["open_question"] or {}).get("target"), "kind")
+        self.assertEqual(d["state"]["kind"]["source"], "document")
+
+    def test_marker_vs_model_direction_conflict_asks(self):
+        self.queue = [resp(action="shipment_apply", kind_source="model_inference", hyp="shipment", lines=[line(qty=5)])]
+        d = dialog.analyze_input(self.c, text="LOGISALL 입고전표\n유형: P10\n수량: 5", actor="owner")
+        self.assertEqual(d["open_question"]["target"], "kind")

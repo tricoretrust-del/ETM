@@ -17,8 +17,8 @@ import urllib.error
 import urllib.request
 import uuid
 
-PROMPT_VERSION = "ETM-P1-2026-11-17"
-SCHEMA_VERSION = "ETM-S1"
+PROMPT_VERSION = "ETM-P2-2026-11-17"
+SCHEMA_VERSION = "ETM-S2"
 DEFAULT_MODEL = "gpt-5.4-mini-2026-03-17"
 TIMEOUT_S = 60
 MAX_RETRY = 1          # 잘못된 구조·일시 오류 시 재시도 횟수
@@ -75,17 +75,21 @@ RESPONSE_SCHEMA = {
                 "pallets_invoice": _NN, "pallets_message": _NN,
                 "lines": {"type": "array", "items": {
                     "type": "object", "additionalProperties": False,
-                    "required": ["item_text", "item_ref", "item_source", "qty", "unit"],
+                    "required": ["item_text", "item_ref", "item_source", "qty", "unit", "owner_ref", "owner_source"],
                     "properties": {"item_text": _S, "item_ref": _SN,
                                    "item_source": {"type": "string", "enum": ["document", "user_answer", "rbk",
                                                                               "master_exact", "case_inference",
                                                                               "model_inference", "none"]},
-                                   "qty": _NN, "unit": _SN}}}}},
+                                   "qty": _NN, "unit": _SN, "owner_ref": _SN,
+                                   "owner_source": {"type": "string", "enum": ["document", "user_answer", "rbk",
+                                                                               "case_inference", "model_inference",
+                                                                               "none"]}}}}}},
         "evidence_refs": {"type": "array", "items": _S},
         "learning_candidates": {"type": "array", "items": {
-            "type": "object", "additionalProperties": False, "required": ["kind", "text", "scope", "explicit_user_instruction"],
-            "properties": {"kind": {"type": "string", "enum": ["lag", "pln", "rbk"]}, "text": _S, "scope": _S,
-                           "explicit_user_instruction": {"type": "boolean"}}}},
+            "type": "object", "additionalProperties": False,
+            "required": ["kind", "text", "scope", "explicit_user_instruction", "target_ref", "alias"],
+            "properties": {"kind": {"type": "string", "enum": ["lag", "pln", "rbk", "alias"]}, "text": _S, "scope": _S,
+                           "explicit_user_instruction": {"type": "boolean"}, "target_ref": _SN, "alias": _SN}}},
     },
 }
 
@@ -109,6 +113,12 @@ SYSTEM_PROMPT = """너는 ETM(사건 기반 거래 관리)의 자료 해석 보�
    learning_candidates 에 kind=rbk, explicit_user_instruction=true 로 조건·범위를 적는다. 명시가 없으면 false.
 10. counterparty 는 자사(context.company.names_in_documents)가 아닌 상대방이다. 입고면 보낸 업체, 출하면 받는 거래처.
 11. action: shipment_apply(출하 반영 가능) / receipt_record(입고 기록) / keep_only(재고와 무관, 보관만) / none(아직 모름).
+12. 사용자가 답으로 품목을 알려 주면(예: 'P10은 KPP 팔레트') 그 줄의 item_ref 를 채우고 item_source=user_answer.
+13. 임대품 소유자: owner_ref 는 제공된 parties 의 'party:<id>' 또는 자사면 'own'. 사용자 답으로 알 수 있으면
+    owner_source=user_answer, 모르면 null/none. 자료를 보내거나 전달한 업체(counterparty)가 소유자라고 가정하지 않는다.
+    예: 'KPP 팔레트를 LOGISALL 이 전달' → 소유자는 KPP(전달자는 LOGISALL).
+14. 사용자가 조건 없는 기준정보 사실(예: 'P10은 KPP 팔레트의 모델명')을 말하면 learning_candidates 에
+    kind=alias, target_ref='item:<id>', alias='P10' 으로 제안한다(업체 조건이 붙은 rbk 가 아님). 다른 종류는 두 값 null.
 모든 출력은 주어진 JSON 스키마를 따른다."""
 
 

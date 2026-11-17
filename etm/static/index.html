@@ -301,7 +301,7 @@ function home(msg){
 // ---------------- 문답 (DEV-004 v0.2): 자료 해석 → 질문 → 자연어 답 → 반영
 let LLM = "off";
 const D_ST = {asking:"답을 기다림", applied:"반영됨", kept:"보관됨", pending_ledger:"장부 반영 미결", failed:"보류"};
-const CAND = {rbk:"규칙으로 등록", lag:"검토 과제로 등록", pln:"할 일로 등록"};
+const CAND = {rbk:"규칙으로 등록", lag:"검토 과제로 등록", pln:"할 일로 등록", alias:"기준정보에 별칭 추가"};
 async function showDialogList(){
   try{
     const r = await api("/api/dialogs"); LLM = r.provider;

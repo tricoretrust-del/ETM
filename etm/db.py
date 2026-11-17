@@ -535,6 +535,10 @@ MIGRATIONS: list[str] = [
     """
     CREATE INDEX IF NOT EXISTS idx_case_key ON decision_case(company_id, decision_kind, decision_key);
     """,
+    # ---- 0008: 학습 후보의 구조화 내용(기준정보 별칭 등) ------------------------------
+    """
+    ALTER TABLE learning_candidate ADD COLUMN payload TEXT;
+    """,
 ]
 
 # 이번 구현에서 명시적으로 적용하는 고정 규칙(운영 룰북 초기값)
