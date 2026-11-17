@@ -1,0 +1,444 @@
+{
+  "title": "ETM 구현 난점 데이터 묶음",
+  "version": "v0.1",
+  "date": "2026-11-17",
+  "source": "CLD 구현 과정(DEV-001~003, CLD-REQ-001~003, 10일 시뮬레이션)",
+  "basis_commit": "f79b511",
+  "fields": [
+    "id",
+    "bundle",
+    "title",
+    "situation",
+    "evidence",
+    "difficulty",
+    "causes",
+    "cause_detail",
+    "interim",
+    "status",
+    "question"
+  ],
+  "cause_codes": {
+    "SPEC": "명세 부재 — 정해지지 않아 개발자가 기본값을 정함",
+    "CONCEPT": "개념 정의 부재 — 같음·상황·판단의 단위가 정의되지 않음",
+    "CONFLICT": "원칙 충돌 — 원칙 간 우선순위가 정해지지 않음",
+    "LAYER": "계층·명칭 혼동 — 문서 계층(TRNK)과 운영 계층, 명칭 변경이 범위를 바꿈",
+    "DATA": "실제 자료 부재 — 가상 데이터로만 검증",
+    "ENV": "환경 차이 — 개발·실행·문서 채널 환경",
+    "CLD": "개발자 선택·오류 — CLD가 범위를 좁히거나 잘못 분류",
+    "TEST": "검증 방식 한계 — 부분 검증이 전체 흐름을 보장하지 못함"
+  },
+  "bundles": {
+    "J": "판단 구조",
+    "L": "학습 구조",
+    "G": "거버넌스·문서 계층",
+    "D": "자료·환경"
+  },
+  "summary": {
+    "by_cause": {
+      "SPEC": 13,
+      "CONCEPT": 5,
+      "CLD": 5,
+      "DATA": 4,
+      "ENV": 4,
+      "CONFLICT": 3,
+      "LAYER": 3,
+      "TEST": 1
+    },
+    "by_bundle": {
+      "J": 7,
+      "L": 8,
+      "G": 5,
+      "D": 5
+    }
+  },
+  "records": [
+    {
+      "id": "J01",
+      "bundle": "J",
+      "title": "자료 종류·가치 이동 방향 오판",
+      "situation": "사용자가 붙여넣은 LOGISALL 입고전표를 출하로 해석. 납품처(지오블록)를 거래처로, 입고일 미인식, 'P10'을 품목 P·수량 10으로 분해",
+      "evidence": "사용자 실제 입력(2026-11-17), 커밋 a3e0ad3, docs/screens/06",
+      "difficulty": "같은 '업체명·납품처' 항목이 문서 종류에 따라 정반대 의미를 가짐. 품목이 등록돼 있었다면 재고를 잘못 차감했을 위험",
+      "causes": [
+        "SPEC",
+        "DATA"
+      ],
+      "cause_detail": "초기 범위가 '출하 한 건'이라 텍스트 해석이 출하를 전제로 고정됨. 입고 양식 실물이 없었음",
+      "interim": "문서 종류(=방향)를 사용자에게 묻고, 반복되면 규칙화(R-L 규칙). 출하 외 종류는 보관만",
+      "status": "위임 구조로 해결. 양식 판별 정확도 문제(J04)는 남음",
+      "question": "모든 자료에 대해 '이 자료가 어떤 가치·돈 이동인가'를 판단하는 첫 판단점을 뼈대에 둘 것인가?"
+    },
+    {
+      "id": "J02",
+      "bundle": "J",
+      "title": "'프로그램은 판단하지 않는다'를 코드로 구현할 수 없음",
+      "situation": "항목 이름 해석(동의어 표), 기준정보 정확 일치 연결, 유사 후보 제시, 양식 키 생성이 모두 코드 안의 판단",
+      "evidence": "etm/textparse.py KEYS, rulebook MASTER-EXACT, docs/DEV-002_REPORT.md §7-5",
+      "difficulty": "판단을 없애면 아무것도 처리하지 못하고, 남기면 원칙 위반. 어디까지가 '조회'이고 어디부터가 '판단'인지 경계가 없음",
+      "causes": [
+        "CONCEPT"
+      ],
+      "cause_detail": "'판단'의 정의와 판단점 목록이 없음",
+      "interim": "추측은 '제안'으로만 표시. 자동 결정은 승인된 규칙 또는 공개된 '코드 기본 동작' 목록 안에서만",
+      "status": "코드 기본 동작 5종 잔존(손글씨·불확실 확인, 정확 일치, 덮어쓰기 금지, 경고 후 확인, 임대료 미생성)",
+      "question": "판단점 카탈로그(무엇이 판단인가, 누가 결정하는가, 학습 가능한가)를 뼈대의 1차 구조로 둘 것인가?"
+    },
+    {
+      "id": "J03",
+      "bundle": "J",
+      "title": "같은 사건인가(동일성) 판정",
+      "situation": "재수신(같은 내용), 같은 전표번호의 다른 내용, 다른 번호의 같은 내용, 같은 날 같은 수량의 실제 다른 출하",
+      "evidence": "tests/test_dev001 test_02·02b, 10일 시뮬레이션 중복 확인 하루 2건",
+      "difficulty": "'한 번 기록'의 '한 번'을 정의해야 했음. 내용 해시만으로는 다른 사진·다른 경로의 같은 사건을 못 잡고, 너무 넓히면 다른 거래를 병합",
+      "causes": [
+        "CONCEPT",
+        "SPEC"
+      ],
+      "cause_detail": "사건 정체성 기준(무엇이 같으면 같은 사건인가) 미정",
+      "interim": "내용 해시=재수신(반영 없음), 같은 전표번호·다른 내용=수정 후보 질문, 같은 날·상대·품목·수량=중복 후보 질문(자동 병합 없음)",
+      "status": "DEV-004: 자동 병합 금지 유지, 응답은 근거로만 재사용. 질문은 계속 발생",
+      "question": "사건 정체성 키(전표번호·상대·일자·품목·수량·증빙)를 사건 종류별로 정의할 것인가?"
+    },
+    {
+      "id": "J04",
+      "bundle": "J",
+      "title": "같은 상황인가(상황 키) — 학습 일반화 단위",
+      "situation": "자료 종류 규칙의 상황 키 = 항목 이름 집합. '기사연락처'↔'기사 전화', '비고' 줄 추가만으로 다른 양식",
+      "evidence": "CLD-REQ-002 항목 6 시험 결과",
+      "difficulty": "넓히면 오적용, 좁히면 학습 안 됨. 규칙의 핵심인데 철학·지시서에 정의가 없었음",
+      "causes": [
+        "CONCEPT"
+      ],
+      "cause_detail": "규칙이 일반화되는 단위(양식·업체·품목·현장)의 정의 부재",
+      "interim": "양식=항목 이름 집합, 품목=업체|품목 표기",
+      "status": "DEV-004: 승인 별칭·핵심/선택 항목·범위 검사 채택(미구현)",
+      "question": "판단점마다 상황 키 구성요소와 허용 오차를 명시하는 구조로 할 것인가?"
+    },
+    {
+      "id": "J05",
+      "bundle": "J",
+      "title": "미확정 값에 의존하는 처리만 보류 — 의존 관계 정의",
+      "situation": "팔레트 미확정이어도 제품 출하는 반영, 품목 줄 단위 반영, 일부 품목만 단가가 있을 때 받을 돈",
+      "evidence": "etm/process.py reconcile, tests test_05·06·07",
+      "difficulty": "한 문장 원칙을 구현하려면 처리→값 의존 관계를 전부 나열해야 함. 부분 금액을 둘지 전체 미확정으로 둘지는 업무 결정",
+      "causes": [
+        "SPEC"
+      ],
+      "cause_detail": "효과별 의존 관계와 부분 확정 시 처리 원칙 미정",
+      "interim": "받을 돈은 보류 줄이 있거나 단가 하나라도 없으면 전체 '금액 미확정'(CLD 기본값)",
+      "status": "CLD-REQ-003 §3에서 확인 요청 중",
+      "question": "효과(재고·돈·미결)마다 의존 필드를 선언하는 표를 뼈대에 둘 것인가?"
+    },
+    {
+      "id": "J06",
+      "bundle": "J",
+      "title": "필수 확인과 수고 감소의 충돌",
+      "situation": "손글씨 '항상 확인'(RBK v0.3) 때문에 규칙 승인 뒤에도 하루 6건 질문 고정",
+      "evidence": "10일 시뮬레이션: 4일차 이후 8건/일 중 6건",
+      "difficulty": "'결국 예외만 묻는다'는 목표와 정확성 원칙이 동시에 성립하지 않음",
+      "causes": [
+        "CONFLICT"
+      ],
+      "cause_detail": "원칙 간 우선순위 미정",
+      "interim": "필수 확인 유지, 목표 달성 불가로 보고",
+      "status": "DEV-004에서 목표를 '필수 확인·정확성을 보존하며 불필요한 반복을 줄임'으로 정정(해결)",
+      "question": "판단점에 '필수 확인(학습 대상 아님)' 속성을 둘 것인가?"
+    },
+    {
+      "id": "J07",
+      "bundle": "J",
+      "title": "라벨 없는 값의 추측 범위",
+      "situation": "'11월 12일'(연도 추측), 라벨 없는 전화번호, 본문 속 거래처 이름",
+      "evidence": "etm/textparse.py, tests/test_textparse",
+      "difficulty": "추측하지 않으면 입력 수고 증가, 추측하면 '판단하지 말라' 위반",
+      "causes": [
+        "SPEC",
+        "CONCEPT"
+      ],
+      "cause_detail": "추론 허용 범위와 표시 방식 미정",
+      "interim": "추측값은 '불확실'로 표시해 확인 요청, 누구 번호인지 모르면 버리고 메모로만 알림",
+      "status": "유지",
+      "question": "추측(제안)과 결정의 구분을 모든 입력 경로에 공통 규칙으로 둘 것인가?"
+    },
+    {
+      "id": "L01",
+      "bundle": "L",
+      "title": "학습 재료가 응답의 10%",
+      "situation": "10일 시뮬레이션 답변 103건 중 판단 기록 10건. 출하의 거래처·품목·담당자·중복 응답은 사실 기록만",
+      "evidence": "CLD-REQ-002 §2, 시뮬레이션 스크립트",
+      "difficulty": "응답이 학습 경로에 들어가지 않으면 같은 질문이 반복됨",
+      "causes": [
+        "CLD",
+        "CONCEPT"
+      ],
+      "cause_detail": "CLD가 판단 기록을 3종 판단에만 연결. 사실 확정과 일반화 근거의 구분이 미정이었음",
+      "interim": "없음(보고)",
+      "status": "DEV-004: 모든 응답 출처 추적, 일반화는 별도 판정(채택, 미구현)",
+      "question": "모든 응답을 '판단점 기록'으로 남기고 일반화 여부만 따로 판정하는 구조로 할 것인가?"
+    },
+    {
+      "id": "L02",
+      "bundle": "L",
+      "title": "실행 규칙으로 바꿀 수 있는 판단 3종 한정",
+      "situation": "사건에서 나온 일반 LAG는 '규칙 반영' 판정 불가, 화면 버튼은 눌러도 거부",
+      "evidence": "learn._draft_from_lag, docs/screens/19",
+      "difficulty": "안전(허용 목록)과 학습 범위가 같은 장치로 묶여 학습이 막힘",
+      "causes": [
+        "SPEC",
+        "CLD"
+      ],
+      "cause_detail": "DEV-002 허용 목록 원칙을 CLD가 '학습 가능 범위'로 좁게 구현",
+      "interim": "기각·보류만 가능",
+      "status": "DEV-004: 참고 규칙/실행 규칙 분리, 후보 동작 확장(채택, 미구현)",
+      "question": "규칙의 '승인 상태'와 '실행 모드'(참고/실행)를 분리한 RBK 구조를 뼈대로 할 것인가?"
+    },
+    {
+      "id": "L03",
+      "bundle": "L",
+      "title": "축 사이 순환 단절 (PLN 결과 → LAG 검증 불가)",
+      "situation": "사건에서 시작한 LAG는 PLN을 완료해도 검증·판정으로 갈 수 없어 영구 '접수'",
+      "evidence": "수정 커밋 f79b511, TestPlanToLagLoop",
+      "difficulty": "RBK·PLN·LAG 각각의 테스트는 모두 통과했지만 연결은 끊겨 있었음",
+      "causes": [
+        "TEST",
+        "CLD"
+      ],
+      "cause_detail": "축별 설계·검증만 하고 순환 시나리오를 검증하지 않음",
+      "interim": "verification_evidence로 수정",
+      "status": "해결",
+      "question": "뼈대 검증을 '사례→LAG→PLN→판정→RBK→재적용' 순환 시나리오 단위로 정의할 것인가?"
+    },
+    {
+      "id": "L04",
+      "bundle": "L",
+      "title": "거버넌스 단계가 늘수록 사용자 동작 증가",
+      "situation": "규칙 하나에 후보 → LAG 등록 → 검증 → 판정 → 승인(최소 3~4 동작)",
+      "evidence": "docs/screens/14·15, DEV-002·003 흐름",
+      "difficulty": "안전한 학습 절차가 R01(입력 수고 감소)과 부딪침",
+      "causes": [
+        "CONFLICT"
+      ],
+      "cause_detail": "학습 통제 비용과 수고 감소 사이의 균형 기준 미정",
+      "interim": "'LAG 등록+사례 검증'을 한 버튼으로 묶음",
+      "status": "미해결",
+      "question": "위험도별로 승인 절차의 단계 수를 달리하는 구조를 둘 것인가?"
+    },
+    {
+      "id": "L05",
+      "bundle": "L",
+      "title": "후보 제시·승격 기준 근거 없음",
+      "situation": "같은 답 3건이면 후보 제시(잠정)",
+      "evidence": "learn.CANDIDATE_AFTER, LAG-001",
+      "difficulty": "숫자에 근거가 없음. 위험이 다른 판단에 같은 기준 적용",
+      "causes": [
+        "SPEC"
+      ],
+      "cause_detail": "승격 최소 근거 미정(LAG-001 OPEN)",
+      "interim": "3건 잠정",
+      "status": "미해결",
+      "question": "판단점별 후보 기준(건수·반례 없음·범위)을 둘 것인가?"
+    },
+    {
+      "id": "L06",
+      "bundle": "L",
+      "title": "규칙 충돌 우선순위 없음",
+      "situation": "같은 대상에 다른 동작의 활성 규칙 2개 → 해당 처리 보류",
+      "evidence": "tests/test_dev002 test_06",
+      "difficulty": "보류는 안전하지만 충돌이 잦으면 질문이 늘어남",
+      "causes": [
+        "SPEC"
+      ],
+      "cause_detail": "우선순위 정책 미정",
+      "interim": "항상 보류 + 이유 표시",
+      "status": "미해결",
+      "question": "범위가 좁은 규칙 우선 등 충돌 해소 정책을 둘 것인가?"
+    },
+    {
+      "id": "L07",
+      "bundle": "L",
+      "title": "'왜'가 남지 않음 — 역엔지니어링 재료 부족",
+      "situation": "규칙 설명이 '항목 구성이 [..]인 자료 → 입고'처럼 기계적, 판정 이유·계획 목적은 선택 입력",
+      "evidence": "docs/screens/14",
+      "difficulty": "완성된 RBK·PLN·LAG에서 사용자 필요를 읽어낼 수 없음",
+      "causes": [
+        "SPEC"
+      ],
+      "cause_detail": "이유·필요 기록 방식 미정",
+      "interim": "없음",
+      "status": "DEV-004 부분 채택(근거 재사용, 판단이 갈리는 동작만 사유)",
+      "question": "판단점·규칙에 '사용자 필요(진술/추론/미확정)' 연결을 둘 것인가?"
+    },
+    {
+      "id": "L08",
+      "bundle": "L",
+      "title": "수고 감소를 측정할 수 없음",
+      "situation": "질문 수·자동 처리 수만 있음. 시간·재입력·수정 기록 없음",
+      "evidence": "learn.overview stats",
+      "difficulty": "학습이 효과가 있었는지 판정 불가(LAG-004)",
+      "causes": [
+        "SPEC",
+        "DATA"
+      ],
+      "cause_detail": "측정 지표·기준선 미정, 실제 사용 기록 없음",
+      "interim": "시뮬레이션 질문 수로만 보고",
+      "status": "DEV-004 채택(미구현)",
+      "question": "측정을 판단점 기록의 부산물로 자동 수집하는 구조로 할 것인가?"
+    },
+    {
+      "id": "G01",
+      "bundle": "G",
+      "title": "운영 PLN이 DB에서 빠짐",
+      "situation": "CUR→PLN+LAG 명칭 정정 때 운영 DB에는 LAG만 남고, DEV-002가 'PLN은 문서'로 확정",
+      "evidence": "CLD-REQ-001, DEV-003 §1",
+      "difficulty": "개선·확장 과제와 진행을 기록할 곳이 없어 LAG→PLN 연결 불가",
+      "causes": [
+        "LAYER"
+      ],
+      "cause_detail": "명칭 변경이 구현 범위를 바꿈",
+      "interim": "지시대로 미구현 후 재요청",
+      "status": "DEV-003으로 해결",
+      "question": "뼈대 문서에서 '명칭 변경'과 '범위 변경'을 분리 표기할 것인가?"
+    },
+    {
+      "id": "G02",
+      "bundle": "G",
+      "title": "설계 질문을 운영 LAG에 오분류",
+      "situation": "'승격 기준', '미결·완결 세부 상태'를 운영 LAG로 이관",
+      "evidence": "DEV-003 재분류표, reclassification 테이블",
+      "difficulty": "운영 사례가 붙을 수 없어 영구 '접수'",
+      "causes": [
+        "CLD",
+        "LAYER"
+      ],
+      "cause_detail": "설계 계층과 운영 계층의 경계가 늦게 정의됨",
+      "interim": "TRNK-LAG로 재분류(LAG-001, TRNK-LAG-005)",
+      "status": "해결",
+      "question": "모든 RBK·PLN·LAG 항목에 계층(TRNK/운영) 필드를 필수로 둘 것인가?"
+    },
+    {
+      "id": "G03",
+      "bundle": "G",
+      "title": "지시서 간 모순·지시와 사용자 의도 차이",
+      "situation": "DEV-001 정정본(운영 LAG에 진행 상태) vs LAG 탭(진행은 PLN), DEV-002(PLN 문서) vs 사용자(PLN DB)",
+      "evidence": "CLD-REQ-001 §2.3",
+      "difficulty": "개발자가 문서와 사용자 말 중 무엇을 따를지 매번 판단",
+      "causes": [
+        "LAYER",
+        "CONFLICT"
+      ],
+      "cause_detail": "정본 우선순위와 변경 전파 절차 미정",
+      "interim": "CLD 채널 개설, 결정 요청으로 처리",
+      "status": "채널로 완화",
+      "question": "지시서 우선순위·폐기 규칙을 뼈대에 명시할 것인가?"
+    },
+    {
+      "id": "G04",
+      "bundle": "G",
+      "title": "개발자가 '활성' 규칙을 미리 삽입",
+      "situation": "DEV-001 구현 때 고정 규칙 6개를 rulebook에 active로 시드",
+      "evidence": "마이그레이션 0001·0003",
+      "difficulty": "DEV-002 '개발자가 승인 기록을 만들지 않는다'와 충돌",
+      "causes": [
+        "CLD",
+        "SPEC"
+      ],
+      "cause_detail": "당시 승인 주체 개념이 없었음",
+      "interim": "팔레트 대조는 승인 대기 초안, 나머지는 코드 기본 동작으로 이관",
+      "status": "해결",
+      "question": "초기값(시드)과 승인된 규칙을 구분하는 원칙을 둘 것인가?"
+    },
+    {
+      "id": "G05",
+      "bundle": "G",
+      "title": "권한·인증의 경계",
+      "situation": "화면 사용자 선택은 인증이 아님. 담당자 자기 실행 지시 허용 여부",
+      "evidence": "DEV-003 보고 §7, DEV-004 §4",
+      "difficulty": "권한 검사를 해도 위조 방지는 아님",
+      "causes": [
+        "SPEC",
+        "ENV"
+      ],
+      "cause_detail": "운영 형태(단일 PC/다중 사용자) 미정",
+      "interim": "역할 기반 검사만, 보고서에 한계 명시",
+      "status": "DEV-004로 권한 기준 정정, 인증은 별도 과제",
+      "question": "운영 형태와 권한 모델을 뼈대 단계에서 정할 것인가?"
+    },
+    {
+      "id": "D01",
+      "bundle": "D",
+      "title": "실제 자료 없이 검증",
+      "situation": "품목·단가·팔레트·거래 모두 가상. 입고전표 문제는 사용자 실제 입력에서 처음 발견",
+      "evidence": "etm/seed.py, J01",
+      "difficulty": "정확성·오적용을 측정할 정답지가 없음",
+      "causes": [
+        "DATA"
+      ],
+      "cause_detail": "실제 증빙·정답지·업무 기록 미확보",
+      "interim": "가상 시나리오와 시뮬레이션",
+      "status": "CLD-REQ-003으로 자료 요청",
+      "question": "뼈대 확정 전에 실제 사례 묶음과 정답지를 기준 데이터로 둘 것인가?"
+    },
+    {
+      "id": "D02",
+      "bundle": "D",
+      "title": "스캔 솔루션 출력 형식 미확보",
+      "situation": "입력 계약 초안만 있고 실제 스캔 출력이 없어 어댑터 없음",
+      "evidence": "docs/INPUT_CONTRACT.md",
+      "difficulty": "①과 ②의 경계(누가 손글씨·불확실을 표시하나)가 확정되지 않음",
+      "causes": [
+        "DATA",
+        "SPEC"
+      ],
+      "cause_detail": "공통 데이터 규격 미확정",
+      "interim": "텍스트 붙여넣기 변환기로 대체",
+      "status": "미해결",
+      "question": "판단의 시작점(추출 불확실성 표시)을 ①이 넘길지 ②가 계산할지 정할 것인가?"
+    },
+    {
+      "id": "D03",
+      "bundle": "D",
+      "title": "개발·실행 환경 차이",
+      "situation": "클라우드 개발 vs Windows 실행: 127.0.0.1 접속 실패, git 미설치, 이전 버전 실행으로 'JSON 아님' 재현",
+      "evidence": "대화 기록(2026-11-17)",
+      "difficulty": "오류가 코드 문제인지 환경 문제인지 구분에 시간 소요",
+      "causes": [
+        "ENV"
+      ],
+      "cause_detail": "배포·업데이트 절차 미정",
+      "interim": "실행·업데이트 명령 안내",
+      "status": "완화",
+      "question": "사용자 PC 배포·업데이트 방식을 뼈대에 포함할 것인가?"
+    },
+    {
+      "id": "D04",
+      "bundle": "D",
+      "title": "문서 채널 용량",
+      "situation": "Google 문서 전체 읽기가 50만 자를 넘어 매번 파일로 저장 후 가공",
+      "evidence": "read_doc 결과 503,478자(2026-11-17)",
+      "difficulty": "채널·지시서가 늘수록 읽기·편집 비용과 오류 위험 증가",
+      "causes": [
+        "ENV"
+      ],
+      "cause_detail": "채널이 단일 문서에 누적되는 구조",
+      "interim": "탭 단위 처리",
+      "status": "미해결",
+      "question": "지시서·보고를 문서 분리 또는 보관(아카이브) 규칙으로 관리할 것인가?"
+    },
+    {
+      "id": "D05",
+      "bundle": "D",
+      "title": "날짜 경계",
+      "situation": "이력·남은 일 날짜를 서버 현지 시각으로 계산",
+      "evidence": "process.history (date('now','localtime'))",
+      "difficulty": "클라우드·PC 시간대가 다르면 날짜 묶음이 달라짐",
+      "causes": [
+        "SPEC",
+        "ENV"
+      ],
+      "cause_detail": "기준 시간대 미정",
+      "interim": "서버 시각",
+      "status": "DEV-004: Asia/Seoul 지정(미구현)",
+      "question": "거래일·처리일·측정 시각의 시간대 원칙을 뼈대에 둘 것인가?"
+    }
+  ]
+}
