@@ -522,3 +522,43 @@ def trace_version(conn, version_id) -> dict:
         "applications": [dict(r) for r in conn.execute("SELECT * FROM rule_application WHERE rule_version_id=? ORDER BY id",
                                                        (version_id,))],
     }
+
+
+# --------------------------------------------------------------------------- 사용자 명시 일반화 지시 (DEV-004 v0.2 §3)
+def directive_rule(conn, *, actor, company_id, decision, condition, action, title, instruction, answer_id, event_id):
+    """'다음에도 이 양식은 팔레트 입고로 처리해' 같은 명시적 지시를 근거로 한 번의 사용자 결정에서
+    LAG(출처) → 판정(규칙 반영) → 규칙 버전을 함께 만든다. 승인권자면 바로 활성화, 아니면 승인 대기.
+    수행하지 않은 검증 기록은 만들지 않는다(검증 0건으로 남김)."""
+    u = user(conn, actor)
+    if u["role"] == "system":
+        raise Forbidden("시스템은 규칙을 만들 수 없습니다")
+    action = validate_action(conn, decision, action)
+    t = _now()
+    lid = conn.execute("INSERT INTO lag(company_id, question, context, status, outcome, origin, created_by, created_at,"
+                       " updated_at) VALUES (?,?,?, 'closed', 'rule', ?, ?, ?, ?)",
+                       (company_id, f"{title} — 사용자 지시로 일반화",
+                        _j({"decision": decision, "condition": condition, "answer_id": answer_id}),
+                        f"dialog answer#{answer_id}", actor, t, t)).lastrowid
+    conn.execute("INSERT INTO lag_log(lag_id, from_status, to_status, note, actor, at) VALUES (?,NULL,'closed',?,?,?)",
+                 (lid, f"사용자 명시 지시: {instruction}", actor, t))
+    if event_id:
+        conn.execute("INSERT INTO lag_link(lag_id, event_id) VALUES (?,?)", (lid, event_id))
+    conn.execute("INSERT INTO judgment(lag_id, kind, reason, evidence, actor, role, at) VALUES (?,?,?,?,?,?,?)",
+                 (lid, "rule", "사용자 명시 일반화 지시", f"answer#{answer_id}: {instruction}", actor, u["role"], t))
+    rule = conn.execute("SELECT r.id FROM rule r JOIN rule_version v ON v.rule_id=r.id WHERE r.decision=? AND"
+                        " r.company_id=? AND v.condition=? LIMIT 1", (decision, company_id, _j(condition))).fetchone()
+    if rule:
+        rid = rule[0]
+    else:
+        n = conn.execute("SELECT COUNT(*) FROM rule WHERE id LIKE 'R-D%'").fetchone()[0] + 1
+        rid = f"R-D{n:03d}"
+        conn.execute("INSERT INTO rule(id, company_id, event_kind, decision, title, created_by, created_at) VALUES (?,?,?,?,?,?,?)",
+                     (rid, company_id, DECISIONS[decision]["event_kind"], decision, title, actor, t))
+    vid = create_version(conn, rule_id=rid, actor=actor, condition=condition, action=action, scope={},
+                         basis=f"사용자 명시 지시(answer#{answer_id}) '{instruction}' · LAG#{lid} · 검증 기록 없음",
+                         description=title, lag_id=lid)
+    status = "pending"
+    if u["role"] in ROLE_CAN_APPROVE:
+        approve_version(conn, version_id=vid, actor=actor, reason="지시한 사용자가 승인권자")
+        status = "active"
+    return {"lag_id": lid, "rule_id": rid, "rule_version_id": vid, "status": status}

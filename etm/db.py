@@ -452,6 +452,85 @@ MIGRATIONS: list[str] = [
     -- 실행 결과가 없는 계획(완료 전)은 검증 근거가 될 수 없다
     CREATE TRIGGER verification_evidence_plan_done BEFORE INSERT ON verification_evidence WHEN NEW.plan_id IS NOT NULL AND (SELECT status FROM plan WHERE id=NEW.plan_id) <> 'DONE' BEGIN SELECT RAISE(ABORT, '완료되지 않은 실행계획은 검증 근거가 될 수 없습니다'); END;
     """,
+    # ---- 0006: DEV-004 v0.2 API 문답 (대화·질문·답변·처리안·호출 이력·학습 후보) ------------
+    """
+    CREATE TABLE dialog (                   -- 자료 하나에 대한 문답 (서버 DB 가 상태 정본)
+        id INTEGER PRIMARY KEY,
+        company_id INTEGER NOT NULL REFERENCES company(id),
+        status TEXT NOT NULL,                -- asking | validating | applied | kept | unsupported | failed
+        revision INTEGER NOT NULL DEFAULT 0, -- 답변·처리안이 바뀔 때마다 증가 (늦게 온 응답 거부)
+        raw_input TEXT NOT NULL,             -- 원문 그대로
+        extracted TEXT NOT NULL DEFAULT '{}',-- 보조 추출값(정규화·정확 일치 조회 결과)
+        state TEXT NOT NULL DEFAULT '{}',    -- 확정된 의미·값과 그 출처
+        hypothesis TEXT,                     -- 마지막 API 가설(제안)
+        event_id INTEGER REFERENCES event(id),
+        status_reason TEXT,
+        created_by TEXT NOT NULL REFERENCES app_user(id),
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE dialog_question (
+        id INTEGER PRIMARY KEY,
+        dialog_id INTEGER NOT NULL REFERENCES dialog(id),
+        revision INTEGER NOT NULL,
+        qkey TEXT NOT NULL,                  -- API 가 붙인 question_id
+        target TEXT NOT NULL,
+        reason TEXT NOT NULL,                -- required_check | unknown_meaning | missing | conflict | duplicate_candidate | confirm_inference
+        text TEXT NOT NULL,
+        options TEXT NOT NULL DEFAULT '[]',
+        proposed TEXT,                       -- '맞음'이 가리키는 제시값
+        origin TEXT NOT NULL,                -- api | server (서버 검증이 만든 확인 질문)
+        status TEXT NOT NULL,                -- open | answered | superseded
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE dialog_answer (
+        id INTEGER PRIMARY KEY,
+        dialog_id INTEGER NOT NULL REFERENCES dialog(id),
+        question_id INTEGER NOT NULL REFERENCES dialog_question(id),
+        raw_text TEXT NOT NULL,              -- 사용자 원문
+        interpretation TEXT,                 -- API 해석(원문과 구별)
+        actor TEXT NOT NULL REFERENCES app_user(id),
+        at TEXT NOT NULL
+    );
+    CREATE TABLE dialog_proposal (
+        id INTEGER PRIMARY KEY,
+        dialog_id INTEGER NOT NULL REFERENCES dialog(id),
+        revision INTEGER NOT NULL,
+        content TEXT NOT NULL,               -- 처리안(JSON)
+        validation TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL,                -- proposed | rejected | applied | superseded
+        event_id INTEGER REFERENCES event(id),
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE llm_call (
+        id INTEGER PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        dialog_id INTEGER REFERENCES dialog(id),
+        dialog_revision INTEGER,
+        provider TEXT NOT NULL, model TEXT NOT NULL,
+        prompt_version TEXT NOT NULL, schema_version TEXT NOT NULL,
+        evidence TEXT NOT NULL DEFAULT '[]', -- 요청에 넣은 근거 ID·버전
+        request TEXT NOT NULL,               -- 재현용 요청(키 제외)
+        response TEXT,
+        status TEXT NOT NULL,                -- ok | invalid | error | stale
+        error TEXT,
+        latency_ms INTEGER, usage TEXT, attempt INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE learning_candidate (       -- API 가 제안한 LAG·PLN·RBK 후보 (자동 생성 아님)
+        id INTEGER PRIMARY KEY,
+        dialog_id INTEGER NOT NULL REFERENCES dialog(id),
+        kind TEXT NOT NULL,                  -- lag | pln | rbk
+        text TEXT NOT NULL,
+        scope TEXT NOT NULL DEFAULT '',
+        explicit_instruction INTEGER NOT NULL DEFAULT 0,
+        answer_id INTEGER REFERENCES dialog_answer(id),
+        status TEXT NOT NULL,                -- suggested | accepted | dismissed
+        linked TEXT,                         -- 수락 시 만든 lag/plan/rule_version 참조
+        created_at TEXT NOT NULL
+    );
+    ALTER TABLE decision_case ADD COLUMN dialog_id INTEGER REFERENCES dialog(id);
+    ALTER TABLE company ADD COLUMN aliases TEXT NOT NULL DEFAULT '[]';   -- 자사 판별용(문서에 나오는 자사 이름)
+    """,
 ]
 
 # 이번 구현에서 명시적으로 적용하는 고정 규칙(운영 룰북 초기값)

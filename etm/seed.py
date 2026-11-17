@@ -57,6 +57,9 @@ def seed_demo(conn) -> None:
         conn.execute("INSERT INTO value_move(event_id, item_id, from_loc, to_loc, owner, qty, reason, created_at)"
                      " VALUES (NULL, ?, 'opening', 'factory', ?, ?, 'opening', ?)",
                      (iid["KPP-PLT"], f"party:{pid['KPP']}", DEMO_PALLETS_AT_FACTORY, now()))
+    with Tx(conn):   # 자사 가정(시험): 문서에 '납품처 주식회사 지오블록'으로 나오는 쪽이 자사. 실제 확인 필요
+        conn.execute("UPDATE company SET name='지오블록', aliases=? WHERE id=1",
+                     (jdump(["주식회사 지오블록", "(주)지오블록", "지오블록"]),))
     # 과거 출하 1건(가상): 담당자 후보 검색의 근거가 된다.
     process.intake(conn, PRIOR_SHIPMENT)
 
