@@ -24,7 +24,8 @@ from pathlib import Path
 
 SCHEMA = Path(__file__).with_name("schema.sql")
 KG = {"TON": 1000.0, "KG": 1.0}
-M3_KG = {"MAT.AGG.STD": 1450.0, "MAT.AGG.SAND": 1450.0}          # 작업일보 MAT 메모
+M3_KG = {"MAT.AGG.STD": 1450.0, "MAT.AGG.SAND": 1450.0, "MAT.AGG.PLS": 1450.0, "MAT.AGG.RCA": 1450.0}  # MAT 메모·원자재 매입가 기록
+TRUCK_KG = {"MAT.AGG.RCA": 17 * 1450.0}                          # 순환골재 1대 = 17 M3 (원자재 매입가 기록)
 BAG_KG = {"MAT.AGG.SIL4": 1600.0, "MAT.AGG.SIL5": 1600.0}        # 통합관리 메모
 PALLET = "PLT.KPP"                                               # KPP 팔레트 실물(소유 KPP)
 
@@ -111,10 +112,10 @@ class Loader:
                        (ev, item, qty, unit, base, frm, to, owner))
         return base
 
-    def money(self, ev, pid, d, item, amount, vat=0, qty=None, price=None, state="확정", due=None, method=None):
-        return self.c.execute("INSERT INTO money(event_id,party_id,dir,item_code,qty,unit_price,price_state,amount,vat,due,method)"
-                              " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                              (ev, pid, d, item, qty, price, state, amount, vat or 0, due, method)).lastrowid
+    def money(self, ev, pid, d, item, amount, vat=0, qty=None, price=None, state="확정", due=None, method=None, for_item=None):
+        return self.c.execute("INSERT INTO money(event_id,party_id,dir,item_code,qty,unit_price,price_state,amount,vat,due,method,"
+                              "for_item) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                              (ev, pid, d, item, qty, price, state, amount, vat or 0, due, method, for_item)).lastrowid
 
     def settle(self, mid, date, amount, method, memo=""):
         self.c.execute("INSERT INTO settle(money_id,date,amount,method,memo) VALUES (?,?,?,?,?)",
@@ -133,13 +134,15 @@ def base_items(L, sku_path):
             conv = dict(KG)
             conv.update({"M3": M3_KG[code]} if code in M3_KG else {})
             conv.update({"BAG": BAG_KG[code]} if code in BAG_KG else {})
+            conv.update({"대": TRUCK_KG[code], "트럭": TRUCK_KG[code]} if code in TRUCK_KG else {})
             L.item(code, name, "MAT", "KG", conv, cost_kind="변동")
         elif t == "CHG":
             L.item(code, name, "CHG", "회", cost_kind="변동")
         else:
             unit = "M2" if code.startswith(("P.PV", "P.ILP", "C.PV", "C.ILP")) else ("회" if t == "S" else "EA")
             L.item(code, name, t, unit)
-    L.item(PALLET, "KPP 팔레트(실물)", "RNT", "EA", owner="KPP")
+    L.item(PALLET, "KPP 팔레트(실물) P10", "RNT", "EA", owner="KPP", alias="P10")
+    L.item("MAT.CEM.SLG", "슬래그시멘트", "MAT", "KG", dict(KG), cost_kind="변동")   # 원자재 매입가 기록(다다씨엠)
 
 
 def load_cost(L, path):
@@ -182,8 +185,9 @@ def load_cost(L, path):
             code = "CHG.RNT.PLT"
         elif lv2 == "운송":
             code = FREIGHT.get(lv3, "CHG.FRT.ETC")
-            if lv4 not in ("없음", ""):
-                memo = f"운반 자재: {lv4}. {memo}".strip()
+            for_item = RAW.get(("골재", lv4)) if lv4 not in ("없음", "") else None
+            if lv4 not in ("없음", "") and not for_item:
+                L.issue(src, i, "운반비 대상 자재 불명", f"운송/{lv3}/{lv4}")
         elif (lv2, lv3) == ("자산", "상품"):
             code = GOODS.get(lv4)
             if not code:
@@ -194,17 +198,18 @@ def load_cost(L, path):
                           "/".join(x for x in (lv2, lv3, lv4) if x and x != "없음"), "X", "회",
                           cost_kind=lv1 if lv1 in ("고정", "변동", "운영") else None)
         ev = L.event(None, date, "비용", pid, f"{src}!{i}", memo=memo)
-        _cost_money(L, src, i, ev, pid, code, amt, vat, qty, price, method, paid, pay_date, date)
+        _cost_money(L, src, i, ev, pid, code, amt, vat, qty, price, method, paid, pay_date, date,
+                    for_item=for_item if lv2 == "운송" else None)
 
 
-def _cost_money(L, src, i, ev, pid, code, amt, vat, qty, price, method, paid, pay_date, date):
+def _cost_money(L, src, i, ev, pid, code, amt, vat, qty, price, method, paid, pay_date, date, for_item=None):
     if amt is None:
         L.issue(src, i, "금액 없음", f"{date} {code}")
         return
     if pid is None:
         L.issue(src, i, "상대 없음", f"{date} {code} {amt}")
     due = pay_date if re.match(r"\d{4}-\d\d-\d\d$", pay_date or "") else None
-    mid = L.money(ev, pid, "AP", code, amt, vat, qty, price, due=due, method=method or None)
+    mid = L.money(ev, pid, "AP", code, amt, vat, qty, price, due=due, method=method or None, for_item=for_item)
     total = amt + (vat or 0)
     if paid == "Y":
         L.settle(mid, due or date, total, method, "지출여부 Y")
@@ -214,22 +219,35 @@ def _cost_money(L, src, i, ev, pid, code, amt, vat, qty, price, method, paid, pa
         L.settle(mid, date, total, pay_date, pay_date)
 
 
-def load_sites(L, ship_path):
-    """납품현장 = 현장주소(없으면 업체명). 청구처·수요처는 가장 많이 나온 조합. 섞인 현장은 정리 대상."""
+def site_key(r):
+    """납품현장 = 주소 + 수요처 (같은 주소라도 수요처가 다르면 다른 납품현장. 예: 파라곤현장의 라인건설 / 주원조경)."""
+    return ((r[14] or r[13]).strip(), r[13].strip())
+
+
+def phone(s):
+    d = re.sub(r"\D", "", str(s or ""))
+    if len(d) == 10 and d.startswith("10"):
+        d = "0" + d                      # 숫자로 저장돼 앞의 0이 빠진 번호
+    return f"{d[:3]}-{d[3:-4]}-{d[-4:]}" if len(d) in (10, 11) else (str(s).strip() or None)
+
+
+def load_sites(L, ship_path, contacts=None):
+    """청구처는 가장 많이 나온 것. 같은 납품현장(주소+수요처)에 청구처가 여럿이면 정리 대상(차수 분리 또는 오기)."""
     combos = defaultdict(Counter)
     for i, r in rows(ship_path, 19):
-        key = r[14] or r[13]
-        if key and r[7]:
-            combos[key][(r[12], r[13])] += 1
+        k = site_key(r)
+        if k[0] and r[7]:
+            combos[k][r[12]] += 1
     site_of = {}
-    for key, cnt in combos.items():
-        (bill, demand), _ = cnt.most_common(1)[0]
-        sid = L.c.execute("INSERT INTO site(address, phase, demand_party_id, bill_party_id) VALUES (?,?,?,?)",
-                          (key, 1, L.party(demand, "수요처"), L.party(bill, "청구처"))).lastrowid
-        site_of[key] = sid
+    for (addr, demand), cnt in combos.items():
+        bill, _ = cnt.most_common(1)[0]
+        contact = (contacts or {}).get((re.sub(r"\s", "", addr), demand))
+        sid = L.c.execute("INSERT INTO site(address, demand_party_id, phase, bill_party_id, contact) VALUES (?,?,?,?,?)",
+                          (addr, L.party(demand, "수요처"), 1, L.party(bill, "청구처"), contact)).lastrowid
+        site_of[(addr, demand)] = sid
         if len(cnt) > 1:
-            L.issue("3.출고", None, "한 현장에 청구처·수요처 여럿(차수 분리 또는 오기)",
-                    f"{key} :: " + " / ".join(f"{b}-{d} {n}줄" for (b, d), n in cnt.most_common()))
+            L.issue("3.출고", None, "같은 납품현장(주소+수요처)에 청구처 여럿(차수 분리 또는 오기)",
+                    f"{addr} / {demand} :: " + " / ".join(f"{b} {n}줄" for b, n in cnt.most_common()))
     return site_of
 
 
@@ -252,7 +270,7 @@ def load_ship(L, path, site_of):
         if no.startswith("(송장없음)"):
             L.issue(src, i0, "송장번호 없음", no)
         bill = L.party(r0[12], "청구처")
-        site = site_of.get(r0[14] or r0[13])
+        site = site_of.get(site_key(r0))
         ev = L.event(None if no.startswith("(") else no, r0[1], "출하", bill, f"{src}!{i0}", site_id=site,
                      memo=" ".join(x for x in (r0[15] and f"차량 {r0[15]}", r0[16], r0[11]) if x))
         for i, r in lines:
@@ -267,14 +285,16 @@ def load_ship(L, path, site_of):
             if sku == "S.FRT":      # 운반비를 채권에서 차감(음수)
                 L.money(ev, pid, "AR", sku, amt if amt is not None else (qty or 0) * (price or 0), 0, qty, price)
                 continue
-            s = site_of.get(r[14] or r[13])
+            s = site_of.get(site_key(r))
             dest = f"site:{s}" if s else "site:?"
             if not s:
                 L.issue(src, i, "납품현장 없음", f"{no} {sku} {qty}")
             if sku == "C.PLT":
                 L.move(ev, PALLET, qty or 0, "EA", "factory", dest, owner="KPP")
-            else:
-                L.move(ev, sku, qty or 0, "", "factory", dest)
+                if price is not None and amt:   # 2025-03 이전에는 청구한 기록이 있다. 그 외에는 청구하지 않는다(채권 없음)
+                    L.money(ev, pid, "AR", sku, amt, round(amt * 0.1), qty, price)
+                continue
+            L.move(ev, sku, qty or 0, "", "factory", dest)
             state = "확정"
             if price is None or (amt in (None, 0) and qty):
                 cand = last_price.get((pid, sku)) or last_price.get(sku)
@@ -353,14 +373,40 @@ def migrate(src_dir, db_path):
     conn = sqlite3.connect(db_path)
     conn.executescript(SCHEMA.read_text(encoding="utf-8"))
     L = Loader(conn)
+    kpp = json.loads((src / "kpp.json").read_text(encoding="utf-8")) if (src / "kpp.json").exists() else []
+    contacts = {}
+    for k in kpp:      # KPP 출하통보의 연락처 = 현장관리자 전화 → 납품현장 기준정보
+        if k["phone"]:
+            contacts[(re.sub(r"\s", "", k["addr"]), k["demand"])] = phone(k["phone"])
     with conn:
         base_items(L, src / "sku.json")
         load_cost(L, src / "cost.json")
-        site_of = load_sites(L, src / "ship.json")
+        site_of = load_sites(L, src / "ship.json", contacts)
         load_ship(L, src / "ship.json", site_of)
         load_prod(L, src / "prod.json")
         load_opening(L, src / "raw1.json", src / "stock5.json")
+        if kpp:
+            check_kpp_notice(L, kpp)
     return conn
+
+
+def check_kpp_notice(L, kpp):
+    """실제 출하통보(손입력)와, 출하 기록에서 만든 통보를 날짜 × 주소 × 수요처로 대조한다."""
+    from . import queries
+    first, last = min(k["date"] for k in kpp), max(k["date"] for k in kpp)
+    made = Counter()
+    for r in queries.kpp_notice(L.c, first, last):
+        made[(r["date"], re.sub(r"\s", "", r["address"] or ""), r["demand"] or "")] += r["qty"]
+    sent = Counter()
+    for k in kpp:
+        if isinstance(k["qty"], (int, float)):
+            sent[(k["date"], re.sub(r"\s", "", k["addr"]), k["demand"])] += k["qty"]
+        else:
+            L.issue("KPP출하통보", k["row"], "수량이 숫자 아님", f"{k['date']} {k['demand']} {k['qty']}")
+    for key in sorted(set(made) | set(sent)):
+        if abs(made[key] - sent[key]) > 0.5:
+            L.issue("KPP출하통보", None, "통보 수량 ≠ 출하 기록",
+                    f"{key[0]} {key[2]} {key[1][:24]} :: 통보 {sent[key]:g} / 출하 {made[key]:g}")
 
 
 if __name__ == "__main__":

@@ -22,13 +22,14 @@ CREATE TABLE party (                -- 상대: 청구처·수요처·공급처·
     name TEXT NOT NULL UNIQUE,
     roles TEXT NOT NULL DEFAULT ''
 );
-CREATE TABLE site (                 -- 납품현장: 수요처 1곳, 청구처 1곳 (다르면 차수로 나눈다)
+CREATE TABLE site (                 -- 납품현장 = 주소 + 수요처. 청구처 1곳 (다르면 차수로 나눈다)
     id INTEGER PRIMARY KEY,
     address TEXT NOT NULL,
-    phase INTEGER NOT NULL DEFAULT 1,
     demand_party_id INTEGER REFERENCES party(id),
+    phase INTEGER NOT NULL DEFAULT 1,
     bill_party_id INTEGER REFERENCES party(id),
-    UNIQUE (address, phase)
+    contact TEXT,                   -- 현장관리자 전화 (KPP 출하통보에 필요)
+    UNIQUE (address, demand_party_id, phase)
 );
 
 -- 사건과 그 결과 -----------------------------------------------------------------
@@ -65,7 +66,8 @@ CREATE TABLE money (                -- 돈: 채권(AR) / 채무(AP)
     amount REAL NOT NULL,           -- 공급가
     vat REAL NOT NULL DEFAULT 0,
     due TEXT,
-    method TEXT
+    method TEXT,
+    for_item TEXT REFERENCES item(code)   -- 운반비가 나른 자재 (원가 = 매입 + 그 자재의 운반비)
 );
 CREATE TABLE settle (               -- 완결 기록 (부분 허용, 취소는 표시만)
     id INTEGER PRIMARY KEY,
