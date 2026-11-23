@@ -11,8 +11,10 @@
 - 3.출고: 송장 1건 = 출하 사건. 가치(공장 → 납품현장) + 채권(청구처). 운반비 = 채무(운송사 미상).
   유형 '운반비'(S.FRT, 음수 단가) = 채권 차감.
   확정이 없는 것은 미결로 두고 사유를 남긴다(사용자 확인 요청 대상, queries.confirmations):
-    단가 없는 출하 = 단가 미결(최근 실제 단가를 참고값으로), 포설규사 = 무상 제공 여부 미결,
-    출고 운반비 = 운반비 부담 미결(계약·상황마다 다름). KPP 팔레트 출하 = 청구하지 않음(채권 없음).
+    단가 없는 출하 = 단가 미결(최근 실제 단가를 참고값으로), 포설규사 = 무상 제공 여부 미결.
+  출고 운반비 = 기본적으로 지오의 채무(확정). KPP 팔레트 출하 = 청구하지 않음(채권 없음).
+  출하처 = Lv1 채무자(거래처) → Lv2 사업(업체명) → Lv3 하차지(현장주소).
+  소모품(부자재) = 재고 관리 없이 구입 기록(채무)만 남긴다.
 - 4.생산매입: 생산판매 = 생산(가치). 소매판매 매입량 = 상품 입고(가치만, 돈은 2.비용).
 - 기초: 1.원자재재고 기초재고, 5.보유재고량 조정(재고조사 2026-10-28).
 """
@@ -42,7 +44,8 @@ RAW = {("시멘트", "OPC"): "MAT.CEM.OPC", ("시멘트", "백시멘트"): "MAT.
 FREIGHT = {"25톤": "CHG.FRT.25T", "18톤": "CHG.FRT.18T", "9.5톤": "CHG.FRT.95T", "5톤축": "CHG.FRT.5TX",
            "1톤": "CHG.FRT.1T", "기타": "CHG.FRT.ETC"}
 GOODS = {"논슬립선형": "C.NSLN", "논슬립점형": "C.NSDT", "포설규사": "C.SLC", "경계석(SC)": "C.CB.SC.GRY",
-         "일반선형": "C.OLN", "일반점형": "C.ODT"}        # 일반선형·점형 = 고강도.선형·점형 (사용자 확인, 명칭 통일 대상)
+         "일반선형": "C.OLN", "일반점형": "C.ODT"}        # 일반선형·점형 = 고강도.선형·점형 (사용자 확인)
+RENAMED = {"일반선형": "고강도 선형", "일반점형": "고강도 점형"}   # '일반'으로 입력하면 안내 후 고강도로 통일
 MAY_BE_FREE = {"C.SLC"}                                  # 출하량에 따라 무상 제공하기도 함(사용자 확인)
 CARD = ("법인카드", "다성카드", "개인카드")
 
@@ -200,9 +203,15 @@ def load_cost(L, path):
                 L.issue(src, i, "운반비 대상 자재 불명", f"운송/{lv3}/{lv4}")
         elif (lv2, lv3) == ("자산", "상품"):
             code = GOODS.get(lv4)
+            if lv4 in RENAMED:
+                L.issue(src, i, "명칭 통일 안내", f"'{lv4}'는 '{RENAMED[lv4]}'(으)로 통일해 기록합니다")
             if not code:
                 code = L.item(f"X.상품.{lv4}", f"상품 {lv4}", "X", unit or "EA")
                 L.issue(src, i, "상품 SKU 대응 불가", f"자산/상품/{lv4} (여러 SKU 또는 미등록)")
+        elif lv2 == "소모품":   # 부자재: 재고 관리 없이 구입 기록(채무)만
+            code = L.item("SUB." + (".".join(x for x in (lv3, lv4) if x and x != "없음") or "ETC"),
+                          "/".join(x for x in (lv3, lv4) if x and x != "없음") or "소모품", "SUB", unit or "EA",
+                          cost_kind=lv1 if lv1 in ("고정", "변동", "운영") else None)
         else:
             code = L.item("X." + ".".join(x for x in (lv2, lv3, lv4) if x and x != "없음"),
                           "/".join(x for x in (lv2, lv3, lv4) if x and x != "없음"), "X", "회",
@@ -230,8 +239,8 @@ def _cost_money(L, src, i, ev, pid, code, amt, vat, qty, price, method, paid, pa
 
 
 def site_key(r):
-    """납품현장 = 주소 + 수요처 (같은 주소라도 수요처가 다르면 다른 납품현장. 예: 파라곤현장의 라인건설 / 주원조경)."""
-    return ((r[14] or r[13]).strip(), r[13].strip())
+    """출하처 경로: (Lv1 채무자 = 거래처, Lv2 사업 = 업체명, Lv3 하차지 = 현장주소)."""
+    return (r[12].strip(), r[13].strip(), (r[14] or "").strip())
 
 
 def phone(s):
@@ -242,22 +251,29 @@ def phone(s):
 
 
 def load_sites(L, ship_path, contacts=None):
-    """청구처는 가장 많이 나온 것. 같은 납품현장(주소+수요처)에 청구처가 여럿이면 정리 대상(차수 분리 또는 오기)."""
-    combos = defaultdict(Counter)
+    """출하처 3단계 트리를 만든다. 같은 하차지 주소가 여러 사업에 나오면 1차·2차 확인 대상으로 표시한다."""
+    paths, owners = set(), defaultdict(set)
     for i, r in rows(ship_path, 19):
+        if not r[7] or not r[1]:
+            continue
         k = site_key(r)
-        if k[0] and r[7]:
-            combos[k][r[12]] += 1
-    site_of = {}
-    for (addr, demand), cnt in combos.items():
-        bill, _ = cnt.most_common(1)[0]
-        contact = (contacts or {}).get((re.sub(r"\s", "", addr), demand))
-        sid = L.c.execute("INSERT INTO site(address, demand_party_id, phase, bill_party_id, contact) VALUES (?,?,?,?,?)",
-                          (addr, L.party(demand, "수요처"), 1, L.party(bill, "청구처"), contact)).lastrowid
-        site_of[(addr, demand)] = sid
-        if len(cnt) > 1:
-            L.issue("3.출고", None, "같은 납품현장(주소+수요처)에 청구처 여럿(차수 분리 또는 오기)",
-                    f"{addr} / {demand} :: " + " / ".join(f"{b} {n}줄" for b, n in cnt.most_common()))
+        if not k[0] or not k[1] or not k[2]:
+            L.issue("3.출고", i, "출하처 단계 빠짐", f"Lv1 {k[0] or '-'} / Lv2 {k[1] or '-'} / Lv3 {k[2] or '-'}")
+            continue
+        paths.add(k)
+        owners[re.sub(r"\s", "", k[2])].add((k[0], k[1]))
+    site_of, proj_of = {}, {}
+    for lv1, lv2, lv3 in sorted(paths):
+        if (lv1, lv2) not in proj_of:
+            proj_of[(lv1, lv2)] = L.c.execute("INSERT INTO project(bill_party_id, name) VALUES (?,?)",
+                                              (L.party(lv1, "채무자"), lv2)).lastrowid
+        contact = (contacts or {}).get((lv1, lv2, re.sub(r"\s", "", lv3)))
+        site_of[(lv1, lv2, lv3)] = L.c.execute("INSERT INTO site(project_id, name, contact) VALUES (?,?,?)",
+                                               (proj_of[(lv1, lv2)], lv3, contact)).lastrowid
+    for addr, who in owners.items():
+        if len(who) > 1:
+            L.issue("3.출고", None, "같은 하차지가 여러 사업에 나옴(1차·2차 확인)",
+                    f"{addr[:30]} :: " + " / ".join(f"{a}-{b}" for a, b in sorted(who)))
     return site_of
 
 
@@ -298,7 +314,7 @@ def load_ship(L, path, site_of):
             s = site_of.get(site_key(r))
             dest = f"site:{s}" if s else "site:?"
             if not s:
-                L.issue(src, i, "납품현장 없음", f"{no} {sku} {qty}")
+                L.issue(src, i, "하차지 없음(출하처 단계 빠짐)", f"{no} {sku} {qty}")
             if sku == "C.PLT":
                 L.move(ev, PALLET, qty or 0, "EA", "factory", dest, owner="KPP")
                 if price is not None and amt:   # 2025-03 이전에는 청구한 기록이 있다. 그 외에는 청구하지 않는다(채권 없음)
@@ -317,9 +333,9 @@ def load_ship(L, path, site_of):
                     amt = (qty or 0) * price
             L.money(ev, pid, "AR", sku, amt, round(amt * 0.1), qty, price, state=state, pending=pending)
         fr = [(i, num(r[17])) for i, r in lines if num(r[17])]
-        for i, f in fr:   # 운반비 부담은 계약·상황마다 다르다 → 확인 전까지 채무 여부 미결
+        for i, f in fr:   # 운반비 채무는 기본적으로 지오에 있다(사용자 확정)
             cp = L.party("운송사 미상", "운송사")
-            L.money(ev, cp, "AP", "CHG.FRT.ETC", f, 0, method=None, state="미결", pending="운반비 부담")
+            L.money(ev, cp, "AP", "CHG.FRT.ETC", f, 0, method=None)
         if fr:
             L.issue(src, i0, "운반비 운송사 미상", f"{no} 운반비 {sum(f for _, f in fr):,.0f}")
 
@@ -385,7 +401,7 @@ def migrate(src_dir, db_path):
     contacts = {}
     for k in kpp:      # KPP 출하통보의 연락처 = 현장관리자 전화 → 납품현장 기준정보
         if k["phone"]:
-            contacts[(re.sub(r"\s", "", k["addr"]), k["demand"])] = phone(k["phone"])
+            contacts[(k["bill"], k["demand"], re.sub(r"\s", "", k["addr"]))] = phone(k["phone"])
     with conn:
         base_items(L, src / "sku.json")
         load_cost(L, src / "cost.json")

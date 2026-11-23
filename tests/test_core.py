@@ -70,10 +70,12 @@ class Core(unittest.TestCase):
         self.assertEqual([n["reason"] for n in notes], ["단가"])
         self.assertIn("2026-01-05 10,000원", notes[0]["basis"])
 
-    def test_site_is_address_plus_demand_with_contact(self):
-        sites = self.c.execute("SELECT s.address, p.name, s.contact FROM site s JOIN party p ON p.id=s.demand_party_id"
-                               " ORDER BY p.name").fetchall()
-        self.assertEqual(sites, [("A현장", "라인", "010-1234-5678"), ("A현장", "주원", None)])
+    def test_ship_to_is_three_levels_with_contact(self):
+        # Lv1 채무자(거래처) → Lv2 사업(업체) → Lv3 하차지. 같은 주소라도 사업이 다르면 다른 하차지 노드
+        sites = self.c.execute("SELECT p.name, pj.name, s.name, s.contact FROM site s JOIN project pj ON pj.id=s.project_id"
+                               " JOIN party p ON p.id=pj.bill_party_id ORDER BY pj.name").fetchall()
+        self.assertEqual(sites, [("반석", "라인", "A현장", "010-1234-5678"), ("반석", "주원", "A현장", None)])
+        self.assertTrue(self.c.execute("SELECT 1 FROM issue WHERE kind LIKE '같은 하차지가 여러 사업에%'").fetchone())
         notice = Q.kpp_notice(self.c, "2026-01-01", "2026-01-31")
         self.assertEqual([(r["date"], r["demand"], r["qty"], r["contact"]) for r in notice],
                          [("2026-01-05", "라인", 2, "010-1234-5678"), ("2026-01-06", "라인", 3, "010-1234-5678"),
@@ -81,6 +83,7 @@ class Core(unittest.TestCase):
 
     def test_settled_vs_open(self):
         self.assertEqual(len(Q.open_money(self.c, "AP")), 2)          # 석분 매입·운반비 미결(수리는 지출여부 Y)
+        self.assertFalse(self.c.execute("SELECT 1 FROM money WHERE pending='운반비 부담'").fetchone())  # 운반비는 지오 채무(확정)
         self.assertEqual(len(Q.open_money(self.c, "AR")), 4)
 
 

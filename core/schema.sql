@@ -1,7 +1,7 @@
 -- ETM 보관 구조 v0 (docs/ETM_STORAGE_v0.md). 보관하는 것은 이것뿐이다. 재고·원가·합계·일일보고는 조회로 계산한다.
 
 -- 기준정보 -------------------------------------------------------------------
-CREATE TABLE item (                 -- 품목: 판매(P/C/S)·원자재(MAT)·비용(CHG)·임대 실물(RNT)·임시(X)
+CREATE TABLE item (                 -- 품목: 판매(P/C/S)·원자재(MAT)·부자재(SUB, 재고 관리 안 함)·비용(CHG)·임대 실물(RNT)·임시(X)
     code TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     type TEXT NOT NULL,             -- P C S MAT CHG RNT X
@@ -22,14 +22,21 @@ CREATE TABLE party (                -- 상대: 청구처·수요처·공급처·
     name TEXT NOT NULL UNIQUE,
     roles TEXT NOT NULL DEFAULT ''
 );
-CREATE TABLE site (                 -- 납품현장 = 주소 + 수요처. 청구처 1곳 (다르면 차수로 나눈다)
+-- 출하처 3단계: Lv1 채무자(party) → Lv2 사업(민간: 건설회사 / 관급: 사업명) → Lv3 하차지(현장명·주소)
+-- 한 하차지에는 사업 하나, 한 사업에는 채무자 하나. 다른 채무자·사업이 끼면 1차·2차처럼 새 노드로 나눈다.
+CREATE TABLE project (              -- Lv2
     id INTEGER PRIMARY KEY,
-    address TEXT NOT NULL,
-    demand_party_id INTEGER REFERENCES party(id),
-    phase INTEGER NOT NULL DEFAULT 1,
-    bill_party_id INTEGER REFERENCES party(id),
+    bill_party_id INTEGER NOT NULL REFERENCES party(id),   -- Lv1 채무자 (관급이면 지자체)
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT '민간' CHECK (kind IN ('민간','관급')),
+    UNIQUE (bill_party_id, name)
+);
+CREATE TABLE site (                 -- Lv3 하차지
+    id INTEGER PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES project(id),
+    name TEXT NOT NULL,             -- 현장명·주소 (예: OOO아파트 현장)
     contact TEXT,                   -- 현장관리자 전화 (KPP 출하통보에 필요)
-    UNIQUE (address, demand_party_id, phase)
+    UNIQUE (project_id, name)
 );
 
 -- 사건과 그 결과 -----------------------------------------------------------------

@@ -24,7 +24,7 @@ def flows(c, item):
 
 def pallets_at_sites(c):
     """KPP 팔레트 납품현장별 체류(회수 기록이 아직 없으므로 출하 누계)."""
-    return c.execute("SELECT s.address, SUM(m.base_qty) FROM move m JOIN site s ON m.to_loc='site:'||s.id"
+    return c.execute("SELECT s.name, SUM(m.base_qty) FROM move m JOIN site s ON m.to_loc='site:'||s.id"
                      " WHERE m.item_code='PLT.KPP' GROUP BY s.id ORDER BY 2 DESC").fetchall()
 
 
@@ -37,13 +37,13 @@ def open_money(c, d):
 
 
 def receivable_tree(c):
-    """미결 채권: 청구처 합계 → 수요처 → 납품현장."""
+    """미결 채권: Lv1 채무자 합계 → Lv2 사업 → Lv3 하차지."""
     return c.execute(
-        "SELECT pb.name, pd.name, s.address, SUM(m.amount+m.vat), SUM(m.price_state='미결')"
+        "SELECT pb.name, pj.name, s.name, SUM(m.amount+m.vat), SUM(m.price_state='미결')"
         " FROM money m JOIN event e ON e.id=m.event_id LEFT JOIN site s ON s.id=e.site_id"
-        " LEFT JOIN party pb ON pb.id=m.party_id LEFT JOIN party pd ON pd.id=s.demand_party_id"
+        " LEFT JOIN project pj ON pj.id=s.project_id LEFT JOIN party pb ON pb.id=m.party_id"
         " WHERE m.dir='AR' AND NOT EXISTS (SELECT 1 FROM settle x WHERE x.money_id=m.id)"
-        " GROUP BY pb.name, pd.name, s.address ORDER BY pb.name, 4 DESC").fetchall()
+        " GROUP BY pb.name, pj.name, s.name ORDER BY pb.name, 4 DESC").fetchall()
 
 
 def monthly(c):
@@ -91,9 +91,9 @@ def kpp_notice(c, start, end):
     """KPP 출하통보: 기간 안의 KPP 팔레트 출하를 납품현장별로. 출하 기록 하나로 만든다(다시 입력하지 않음)."""
     out = []
     for d, bill, demand, addr, contact, qty, memo in c.execute(
-            "SELECT e.date, pb.name, pd.name, s.address, s.contact, SUM(m.qty), e.memo FROM move m"
+            "SELECT e.date, pb.name, pj.name, s.name, s.contact, SUM(m.qty), e.memo FROM move m"
             " JOIN event e ON e.id=m.event_id JOIN site s ON m.to_loc='site:'||s.id"
-            " LEFT JOIN party pb ON pb.id=s.bill_party_id LEFT JOIN party pd ON pd.id=s.demand_party_id"
+            " JOIN project pj ON pj.id=s.project_id LEFT JOIN party pb ON pb.id=pj.bill_party_id"
             " WHERE m.item_code='PLT.KPP' AND e.kind='출하' AND e.date BETWEEN ? AND ?"
             " GROUP BY e.id ORDER BY e.date, e.id", (start, end)):
         car = memo.split()[1] if memo.startswith("차량 ") else ""
@@ -104,9 +104,9 @@ def kpp_notice(c, start, end):
 
 def kpp_at_sites(c, until=None):
     """KPP 팔레트 납품현장별 체류 = 출하 누계 − 회수(회수 기록이 생기면 차감)."""
-    q = ("SELECT pd.name, s.address, s.contact, SUM(CASE WHEN m.to_loc='site:'||s.id THEN m.qty ELSE -m.qty END)"
+    q = ("SELECT pj.name, s.name, s.contact, SUM(CASE WHEN m.to_loc='site:'||s.id THEN m.qty ELSE -m.qty END)"
          " FROM move m JOIN event e ON e.id=m.event_id JOIN site s ON m.to_loc='site:'||s.id OR m.from_loc='site:'||s.id"
-         " LEFT JOIN party pd ON pd.id=s.demand_party_id WHERE m.item_code='PLT.KPP'")
+         " JOIN project pj ON pj.id=s.project_id WHERE m.item_code='PLT.KPP'")
     args = []
     if until:
         q += " AND e.date<=?"; args.append(until)
@@ -118,8 +118,8 @@ def confirmations(c, limit=None):
     """사용자 확인 요청(notice): 확정이 없어 미결로 둔 돈 줄. 판단 근거로 같은 청구처의 단가 기록을 붙인다."""
     out = []
     q = ("SELECT m.id, m.pending, e.date, e.no, p.name, i.name, m.item_code, m.qty, m.unit_price, m.amount, m.party_id,"
-         " s.address, pd.name FROM money m JOIN event e ON e.id=m.event_id LEFT JOIN party p ON p.id=m.party_id"
-         " LEFT JOIN item i ON i.code=m.item_code LEFT JOIN site s ON s.id=e.site_id LEFT JOIN party pd ON pd.id=s.demand_party_id"
+         " s.name, pd.name FROM money m JOIN event e ON e.id=m.event_id LEFT JOIN party p ON p.id=m.party_id"
+         " LEFT JOIN item i ON i.code=m.item_code LEFT JOIN site s ON s.id=e.site_id LEFT JOIN project pd ON pd.id=s.project_id"
          " WHERE m.price_state='미결' ORDER BY e.date, m.id")
     for mid, why, d, no, party, iname, code, qty, price, amt, pid, addr, demand in c.execute(q + (f" LIMIT {int(limit)}" if limit else "")):
         hist = c.execute("SELECT e.date, m.unit_price FROM money m JOIN event e ON e.id=m.event_id WHERE m.party_id=?"
