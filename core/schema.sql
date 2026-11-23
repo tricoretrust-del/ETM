@@ -62,7 +62,8 @@ CREATE TABLE money (                -- 돈: 채권(AR) / 채무(AP)
     item_code TEXT REFERENCES item(code),
     qty REAL,
     unit_price REAL,
-    price_state TEXT NOT NULL DEFAULT '확정' CHECK (price_state IN ('확정','임시')),  -- 임시 = 단가 미결
+    price_state TEXT NOT NULL DEFAULT '확정' CHECK (price_state IN ('확정','미결')),  -- 미결 = 사용자 확인 전
+    pending TEXT,                   -- 미결 사유: 단가 / 무상 제공 여부 / 운반비 부담
     amount REAL NOT NULL,           -- 공급가
     vat REAL NOT NULL DEFAULT 0,
     due TEXT,

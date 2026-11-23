@@ -29,7 +29,7 @@ def pallets_at_sites(c):
 
 
 def open_money(c, d):
-    """미결 = 금액(+부가세) − 완결 합계 > 0."""
+    """미결 = 금액(+부가세) − 완결 합계 > 0. (확인 미결은 confirmations)"""
     return c.execute(
         "SELECT m.*, (m.amount+m.vat) - COALESCE((SELECT SUM(amount) FROM settle s WHERE s.money_id=m.id AND NOT cancelled),0)"
         " AS remain FROM money m WHERE m.dir=? AND (m.amount+m.vat) - COALESCE((SELECT SUM(amount) FROM settle s"
@@ -39,7 +39,7 @@ def open_money(c, d):
 def receivable_tree(c):
     """미결 채권: 청구처 합계 → 수요처 → 납품현장."""
     return c.execute(
-        "SELECT pb.name, pd.name, s.address, SUM(m.amount+m.vat), SUM(m.price_state='임시')"
+        "SELECT pb.name, pd.name, s.address, SUM(m.amount+m.vat), SUM(m.price_state='미결')"
         " FROM money m JOIN event e ON e.id=m.event_id LEFT JOIN site s ON s.id=e.site_id"
         " LEFT JOIN party pb ON pb.id=m.party_id LEFT JOIN party pd ON pd.id=s.demand_party_id"
         " WHERE m.dir='AR' AND NOT EXISTS (SELECT 1 FROM settle x WHERE x.money_id=m.id)"
@@ -112,3 +112,39 @@ def kpp_at_sites(c, until=None):
         q += " AND e.date<=?"; args.append(until)
     return c.execute(q + " GROUP BY s.id HAVING SUM(CASE WHEN m.to_loc='site:'||s.id THEN m.qty ELSE -m.qty END) <> 0"
                          " ORDER BY 4 DESC", args).fetchall()
+
+
+def confirmations(c, limit=None):
+    """사용자 확인 요청(notice): 확정이 없어 미결로 둔 돈 줄. 판단 근거로 같은 청구처의 단가 기록을 붙인다."""
+    out = []
+    q = ("SELECT m.id, m.pending, e.date, e.no, p.name, i.name, m.item_code, m.qty, m.unit_price, m.amount, m.party_id,"
+         " s.address, pd.name FROM money m JOIN event e ON e.id=m.event_id LEFT JOIN party p ON p.id=m.party_id"
+         " LEFT JOIN item i ON i.code=m.item_code LEFT JOIN site s ON s.id=e.site_id LEFT JOIN party pd ON pd.id=s.demand_party_id"
+         " WHERE m.price_state='미결' ORDER BY e.date, m.id")
+    for mid, why, d, no, party, iname, code, qty, price, amt, pid, addr, demand in c.execute(q + (f" LIMIT {int(limit)}" if limit else "")):
+        hist = c.execute("SELECT e.date, m.unit_price FROM money m JOIN event e ON e.id=m.event_id WHERE m.party_id=?"
+                         " AND m.item_code=? AND m.price_state='확정' AND e.date<=? ORDER BY e.date DESC LIMIT 3",
+                         (pid, code, d)).fetchall()
+        basis = ", ".join(f"{hd} {hp:,.0f}원" for hd, hp in hist) or "이 청구처의 확정 단가 기록 없음"
+        where = " / ".join(x for x in (demand, addr) if x)
+        if why == "무상 제공 여부":
+            msg = f"{d} {party} {where}에 {iname} {(qty or 0):g}개를 출하했습니다. 무상 제공인가요, 판매인가요?"
+        elif why == "운반비 부담":
+            sh = c.execute("SELECT pb.name FROM event e LEFT JOIN party pb ON pb.id=e.party_id WHERE e.id="
+                           "(SELECT event_id FROM money WHERE id=?)", (mid,)).fetchone()[0]
+            msg = f"{d} 송장 {no or '-'} ({sh}) 운반비 {amt:,.0f}원은 우리 부담인가요?"
+            prices = "; ".join(f"{iname_} {u:,.0f}원" for iname_, u in c.execute(
+                "SELECT DISTINCT i.name, m.unit_price FROM money m JOIN event e ON e.id=m.event_id JOIN item i ON i.code=m.item_code"
+                " WHERE e.id=(SELECT event_id FROM money WHERE id=?) AND m.dir='AR' AND m.unit_price IS NOT NULL", (mid,))) \
+                or "이 송장의 판매 단가 기록 없음"
+            ours, theirs = c.execute(   # 같은 청구처 송장의 운반비를 사용자가 확정한 기록(우리 부담 = 채무 유지, 거래처 부담 = 0원 확정)
+                "SELECT SUM(m.amount>0), SUM(m.amount=0) FROM money m JOIN event e ON e.id=m.event_id"
+                " WHERE m.item_code LIKE 'CHG.FRT%' AND m.dir='AP' AND m.price_state='확정' AND e.kind='출하'"
+                " AND e.party_id=(SELECT party_id FROM event WHERE id=(SELECT event_id FROM money WHERE id=?))", (mid,)).fetchone()
+            hist = f"이 청구처의 지난 운반비 확정: 우리 부담 {ours or 0}건 / 거래처 부담 {theirs or 0}건"
+            basis = f"판매 단가 {prices}. {hist}"
+        else:
+            msg = f"{d} {party} {where}에 출하한 {iname} {(qty or 0):g}의 단가가 없습니다. 얼마인가요?"
+        out.append({"money_id": mid, "reason": why, "message": msg, "basis": basis,
+                    "reference_amount": amt if why != "운반비 부담" else None})
+    return out

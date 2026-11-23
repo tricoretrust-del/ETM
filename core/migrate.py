@@ -9,7 +9,10 @@
   KPP팔레트 = 사용료 채무만(실물 수량은 4.생산매입). 결재방법 원가용·해당없음 = 돈 없음. 월총비용 = 제외.
   그 밖 = 비용(채무). 지출여부 Y·카드·자동이체·선급금 = 완결 기록.
 - 3.출고: 송장 1건 = 출하 사건. 가치(공장 → 납품현장) + 채권(청구처). 운반비 = 채무(운송사 미상).
-  유형 '운반비'(S.FRT, 음수 단가) = 채권 차감. 단가 없음 = 최근 실제 단가로 임시 단가(단가 미결).
+  유형 '운반비'(S.FRT, 음수 단가) = 채권 차감.
+  확정이 없는 것은 미결로 두고 사유를 남긴다(사용자 확인 요청 대상, queries.confirmations):
+    단가 없는 출하 = 단가 미결(최근 실제 단가를 참고값으로), 포설규사 = 무상 제공 여부 미결,
+    출고 운반비 = 운반비 부담 미결(계약·상황마다 다름). KPP 팔레트 출하 = 청구하지 않음(채권 없음).
 - 4.생산매입: 생산판매 = 생산(가치). 소매판매 매입량 = 상품 입고(가치만, 돈은 2.비용).
 - 기초: 1.원자재재고 기초재고, 5.보유재고량 조정(재고조사 2026-10-28).
 """
@@ -38,7 +41,9 @@ RAW = {("시멘트", "OPC"): "MAT.CEM.OPC", ("시멘트", "백시멘트"): "MAT.
        ("안료", "블랙"): "MAT.PIG.BLK", ("안료", "아이보리"): "MAT.PIG.IVR", ("안료", "오렌지"): "MAT.PIG.ORG"}
 FREIGHT = {"25톤": "CHG.FRT.25T", "18톤": "CHG.FRT.18T", "9.5톤": "CHG.FRT.95T", "5톤축": "CHG.FRT.5TX",
            "1톤": "CHG.FRT.1T", "기타": "CHG.FRT.ETC"}
-GOODS = {"논슬립선형": "C.NSLN", "논슬립점형": "C.NSDT", "포설규사": "C.SLC", "경계석(SC)": "C.CB.SC.GRY"}
+GOODS = {"논슬립선형": "C.NSLN", "논슬립점형": "C.NSDT", "포설규사": "C.SLC", "경계석(SC)": "C.CB.SC.GRY",
+         "일반선형": "C.OLN", "일반점형": "C.ODT"}        # 일반선형·점형 = 고강도.선형·점형 (사용자 확인, 명칭 통일 대상)
+MAY_BE_FREE = {"C.SLC"}                                  # 출하량에 따라 무상 제공하기도 함(사용자 확인)
 CARD = ("법인카드", "다성카드", "개인카드")
 
 
@@ -113,10 +118,11 @@ class Loader:
                        (ev, item, qty, unit, base, frm, to, owner))
         return base
 
-    def money(self, ev, pid, d, item, amount, vat=0, qty=None, price=None, state="확정", due=None, method=None, for_item=None):
-        return self.c.execute("INSERT INTO money(event_id,party_id,dir,item_code,qty,unit_price,price_state,amount,vat,due,method,"
-                              "for_item) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                              (ev, pid, d, item, qty, price, state, amount, vat or 0, due, method, for_item)).lastrowid
+    def money(self, ev, pid, d, item, amount, vat=0, qty=None, price=None, state="확정", due=None, method=None, for_item=None,
+              pending=None):
+        return self.c.execute("INSERT INTO money(event_id,party_id,dir,item_code,qty,unit_price,price_state,pending,amount,vat,"
+                              "due,method,for_item) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                              (ev, pid, d, item, qty, price, state, pending, amount, vat or 0, due, method, for_item)).lastrowid
 
     def settle(self, mid, date, amount, method, memo=""):
         self.c.execute("INSERT INTO settle(money_id,date,amount,method,memo) VALUES (?,?,?,?,?)",
@@ -144,6 +150,9 @@ def base_items(L, sku_path):
             L.item(code, name, t, unit)
     L.item(PALLET, "KPP 팔레트(실물) P10", "RNT", "EA", owner="KPP", alias="P10")
     L.item("MAT.CEM.SLG", "슬래그시멘트", "MAT", "KG", dict(KG), cost_kind="변동")   # 원자재 매입가 기록(다다씨엠)
+    for code, alias in (("C.OLN", "일반선형"), ("C.ODT", "일반점형")):
+        if code in L.items:
+            L.item(code, "", "C", "EA", alias=alias)
 
 
 def load_cost(L, path):
@@ -262,7 +271,7 @@ def load_ship(L, path, site_of):
             continue
         no = r[2] or f"(송장없음){r[1]}|{r[12]}|{r[14] or r[13]}"
         by_no[no].append((i, r))
-    last_price = {}      # (청구처, SKU) / SKU → 최근 실제 단가 (임시 단가용)
+    last_price = {}      # (청구처, SKU) / SKU → 최근 실제 단가 (미결 단가의 참고값)
     for no, lines in sorted(by_no.items(), key=lambda kv: (kv[1][0][1][1], kv[0])):
         i0, r0 = lines[0]
         trip = {(r[12], r[13], r[14] or r[13]) for _, r in lines if r[7] != "S.FRT"}
@@ -296,23 +305,21 @@ def load_ship(L, path, site_of):
                     L.money(ev, pid, "AR", sku, amt, round(amt * 0.1), qty, price)
                 continue
             L.move(ev, sku, qty or 0, "", "factory", dest)
-            state = "확정"
+            state, pending = "확정", None
             if price is None or (amt in (None, 0) and qty):
-                cand = last_price.get((pid, sku)) or last_price.get(sku)
-                if cand is None:
-                    L.issue(src, i, "단가 없음·임시 단가도 없음", f"{no} {sku} {qty}")
-                    continue
-                price, state = cand, "임시"
-                amt = (qty or 0) * price
+                # 확정이 없다 → 미결. 최근 실제 단가(같은 청구처 → 같은 품목)를 참고 금액으로 둔다
+                price = last_price.get((pid, sku)) or last_price.get(sku)
+                amt = (qty or 0) * (price or 0)
+                state, pending = "미결", ("무상 제공 여부" if sku in MAY_BE_FREE else "단가")
             else:
                 last_price[(pid, sku)] = last_price[sku] = price
                 if amt is None:
                     amt = (qty or 0) * price
-            L.money(ev, pid, "AR", sku, amt, round(amt * 0.1), qty, price, state=state)
+            L.money(ev, pid, "AR", sku, amt, round(amt * 0.1), qty, price, state=state, pending=pending)
         fr = [(i, num(r[17])) for i, r in lines if num(r[17])]
-        for i, f in fr:
+        for i, f in fr:   # 운반비 부담은 계약·상황마다 다르다 → 확인 전까지 채무 여부 미결
             cp = L.party("운송사 미상", "운송사")
-            L.money(ev, cp, "AP", "CHG.FRT.ETC", f, 0, method=None)
+            L.money(ev, cp, "AP", "CHG.FRT.ETC", f, 0, method=None, state="미결", pending="운반비 부담")
         if fr:
             L.issue(src, i0, "운반비 운송사 미상", f"{no} 운반비 {sum(f for _, f in fr):,.0f}")
 
@@ -345,7 +352,7 @@ def load_prod(L, path):
 def load_opening(L, raw1_path, stock5_path):
     names = {"규사#4": "MAT.AGG.SIL4", "규사#5": "MAT.AGG.SIL5", "블랙": "MAT.PIG.BLK", "아이보리": "MAT.PIG.IVR",
              "브라운": "MAT.PIG.BRN", "오렌지": "MAT.PIG.ORG", "KPP팔레트": PALLET, "포설규사": "C.SLC",
-             "논슬립선형": "C.NSLN", "논슬립점형": "C.NSDT"}
+             "논슬립선형": "C.NSLN", "논슬립점형": "C.NSDT", "일반선형": "C.OLN", "일반점형": "C.ODT"}
     ev = L.event(None, "2024-09-01", "조정", None, "1.원자재재고 기초재고")
     for i, r in rows(raw1_path, 10):
         code, q, unit = names.get(r[1]), num(r[3]), r[2]

@@ -61,11 +61,14 @@ class Core(unittest.TestCase):
 
     def test_kpp_pallets_not_billed_unless_price_recorded(self):
         rows = self.c.execute("SELECT qty, unit_price, price_state FROM money WHERE item_code='C.PLT'").fetchall()
-        self.assertEqual(rows, [(3, 10000, "확정")])            # 단가 없는 팔레트 출하는 채권·임시 단가 없음
+        self.assertEqual(rows, [(3, 10000, "확정")])            # 단가 없는 팔레트 출하는 채권 없음
 
     def test_missing_price_is_provisional_from_latest_actual(self):
         rows = self.c.execute("SELECT qty, unit_price, price_state FROM money WHERE item_code='P.PV.226N.GRY' ORDER BY id").fetchall()
-        self.assertEqual(rows, [(100, 10000, "확정"), (10, 10000, "임시"), (5, 9000, "확정")])
+        self.assertEqual(rows, [(100, 10000, "확정"), (10, 10000, "미결"), (5, 9000, "확정")])
+        notes = Q.confirmations(self.c)
+        self.assertEqual([n["reason"] for n in notes], ["단가"])
+        self.assertIn("2026-01-05 10,000원", notes[0]["basis"])
 
     def test_site_is_address_plus_demand_with_contact(self):
         sites = self.c.execute("SELECT s.address, p.name, s.contact FROM site s JOIN party p ON p.id=s.demand_party_id"
