@@ -76,6 +76,7 @@ class Loader:
         self.c = conn
         self.party_ids = {}
         self.items = set()
+        self.frt_cost = Counter()   # 달별 비용 탭 운송 줄 합계: 출고 운반비와 같은 운행을 운송사별로 묶어 적은 것
 
     # -- 기준정보
     def item(self, code, name, typ, unit, conv=None, owner="own", cost_kind=None, alias=None):
@@ -229,6 +230,8 @@ def _cost_money(L, src, i, ev, pid, code, amt, vat, qty, price, method, paid, pa
         L.issue(src, i, "상대 없음", f"{date} {code} {amt}")
     due = pay_date if re.match(r"\d{4}-\d\d-\d\d$", pay_date or "") else None
     mid = L.money(ev, pid, "AP", code, amt, vat, qty, price, due=due, method=method or None, for_item=for_item)
+    if code.startswith("CHG.FRT") and not for_item:
+        L.frt_cost[date[:7]] += amt
     total = amt + (vat or 0)
     if paid == "Y":
         L.settle(mid, due or date, total, method, "지출여부 Y")
@@ -287,6 +290,12 @@ def load_ship(L, path, site_of):
             continue
         no = r[2] or f"(송장없음){r[1]}|{r[12]}|{r[14] or r[13]}"
         by_no[no].append((i, r))
+    ship_frt = Counter()
+    for ls in by_no.values():
+        for _, r in ls:
+            ship_frt[r[1][:7]] += num(r[17]) or 0
+    # 비용 탭이 그 달 출고 운반비의 절반 이상을 운송사별로 적었으면 그 달은 비용 탭이 운반비 채무의 기록이다
+    cost_has_frt = {m for m, v in ship_frt.items() if v > 0 and L.frt_cost[m] >= v / 2}
     last_price = {}      # (청구처, SKU) / SKU → 최근 실제 단가 (미결 단가의 참고값)
     for no, lines in sorted(by_no.items(), key=lambda kv: (kv[1][0][1][1], kv[0])):
         i0, r0 = lines[0]
@@ -333,11 +342,13 @@ def load_ship(L, path, site_of):
                     amt = (qty or 0) * price
             L.money(ev, pid, "AR", sku, amt, round(amt * 0.1), qty, price, state=state, pending=pending)
         fr = [(i, num(r[17])) for i, r in lines if num(r[17])]
-        for i, f in fr:   # 운반비 채무는 기본적으로 지오에 있다(사용자 확정)
-            cp = L.party("운송사 미상", "운송사")
+        if not fr or r0[1][:7] in cost_has_frt:
+            # 그 달 운반비는 비용 탭 운송 줄(운송사 이름 있음)이 같은 운행의 채무다. 두 번 적지 않는다.
+            continue
+        cp = L.party("운송사 미상", "운송사")   # 운반비 채무는 기본적으로 지오에 있다(사용자 확정)
+        for i, f in fr:
             L.money(ev, cp, "AP", "CHG.FRT.ETC", f, 0, method=None)
-        if fr:
-            L.issue(src, i0, "운반비 운송사 미상", f"{no} 운반비 {sum(f for _, f in fr):,.0f}")
+        L.issue(src, i0, "운반비 운송사 미상", f"{no} 운반비 {sum(f for _, f in fr):,.0f}")
 
 
 def load_prod(L, path):

@@ -148,3 +148,43 @@ def confirmations(c, limit=None):
         out.append({"money_id": mid, "reason": why, "message": msg, "basis": basis,
                     "reference_amount": amt if why != "운반비 부담" else None})
     return out
+
+
+def month_cost(c, month):
+    """월 원가 (비용 탭 고정·변동·운영 틀). 원자재는 그달 사용량 × 품목 평균 단가(매입+운반비), 그 밖은 그달 채무.
+    생산 원가 = 합계 − 상품 매입 − 출하 운반비. 단위 원가 = 생산 원가 / 그달 생산량(M2)."""
+    _, avg = material_cost(c)
+    kind = {"고정": 0.0, "변동": 0.0, "운영": 0.0}
+    goods = freight = 0.0
+    for typ, ck, code, for_item, amt in c.execute(
+            "SELECT i.type, i.cost_kind, m.item_code, m.for_item, m.amount FROM money m JOIN event e ON e.id=m.event_id"
+            " LEFT JOIN item i ON i.code=m.item_code WHERE m.dir='AP' AND substr(e.date,1,7)=?", (month,)):
+        if typ == "MAT" or for_item:           # 원자재 매입·원자재 운반비는 사용량 원가로 들어간다
+            continue
+        if typ in ("C", "S", "P") or (code or "").startswith(("C.", "S.", "X.상품")):   # 상품 매입
+            goods += amt; kind["운영"] += amt
+            continue
+        if (code or "").startswith("CHG.FRT"):
+            freight += amt
+        kind[ck or "변동"] += amt
+    raw = sum(kg * (avg.get(item) or 0) for item, kg in c.execute(
+        "SELECT m.item_code, SUM(m.base_qty) FROM move m JOIN event e ON e.id=m.event_id"
+        " WHERE e.kind='사용' AND substr(e.date,1,7)=? AND m.base_qty IS NOT NULL GROUP BY 1", (month,)))
+    kind["변동"] += raw
+    made = c.execute("SELECT COALESCE(SUM(m.qty),0) FROM move m JOIN event e ON e.id=m.event_id"
+                     " WHERE e.kind='생산' AND substr(e.date,1,7)=?", (month,)).fetchone()[0]
+    total = sum(kind.values())
+    prod = total - goods - freight
+    return {"month": month, **kind, "raw": raw, "total": total, "goods": goods, "freight": freight,
+            "production_cost": prod, "made_m2": made, "per_m2": prod / made if made else None}
+
+
+def month_cost_text(c, month):
+    """월 원가를 몇 줄의 문장으로."""
+    r = month_cost(c, month)
+    w = lambda x: f"{x / 10000:,.0f}만 원"
+    lines = [f"{month} 지출 {w(r['total'])}: 고정 {w(r['고정'])}, 변동 {w(r['변동'])}(원자재 {w(r['raw'])}), 운영 {w(r['운영'])}.",
+             f"상품 매입 {w(r['goods'])}과 출하 운반비 {w(r['freight'])}을 빼면 생산 원가 {w(r['production_cost'])}."]
+    if r["made_m2"]:
+        lines.append(f"생산 {r['made_m2']:,.0f}㎡ → ㎡당 {r['per_m2']:,.0f}원.")
+    return "\n".join(lines)

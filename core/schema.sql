@@ -22,13 +22,12 @@ CREATE TABLE party (                -- 상대: 청구처·수요처·공급처·
     name TEXT NOT NULL UNIQUE,
     roles TEXT NOT NULL DEFAULT ''
 );
--- 출하처 3단계: Lv1 채무자(party) → Lv2 사업(민간: 건설회사 / 관급: 사업명) → Lv3 하차지(현장명·주소)
+-- 출하처 3단계: Lv1 채무자(party) → Lv2 사업(민간: 건설회사 / 관급: 사업명) → Lv3 하차지(현장명·주소). 관급 여부는 채무자(지자체)로 드러나므로 따로 표시하지 않는다.
 -- 한 하차지에는 사업 하나, 한 사업에는 채무자 하나. 다른 채무자·사업이 끼면 1차·2차처럼 새 노드로 나눈다.
 CREATE TABLE project (              -- Lv2
     id INTEGER PRIMARY KEY,
     bill_party_id INTEGER NOT NULL REFERENCES party(id),   -- Lv1 채무자 (관급이면 지자체)
     name TEXT NOT NULL,
-    kind TEXT NOT NULL DEFAULT '민간' CHECK (kind IN ('민간','관급')),
     UNIQUE (bill_party_id, name)
 );
 CREATE TABLE site (                 -- Lv3 하차지
