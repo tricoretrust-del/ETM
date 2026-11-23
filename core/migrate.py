@@ -97,6 +97,7 @@ class Loader:
         return pid
 
     def issue(self, src, row, kind, detail):
+        detail = re.sub(r"01\d-?\d{3,4}-?\d{4}", "010-****-****", detail)   # 정리 목록에 개인 전화번호를 남기지 않는다
         self.c.execute("INSERT INTO issue(source,row,kind,detail) VALUES (?,?,?,?)", (src, row, kind, detail))
 
     # -- 사건
